@@ -216,71 +216,45 @@ def detected_line(img, filename):
         
     return img
 
-def extract_frames_with_timestamp(video_path, output_name=None):
-    # 建立輸出資料夾
-    # if not os.path.exists(output_dir):
-    #     os.makedirs(output_dir)
+def extract_frames_with_timestamp(input_dir, output_name=None):
 
-    # 開啟影片檔案
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"無法開啟影片: {video_path}")
-        print("無法開啟影片")
-        return 0
+    # ======= 遍歷資料夾 =======
+    image_files = [f for f in os.listdir(input_dir) if f.endswith(('.png'))]
 
-    fps = cap.get(cv2.CAP_PROP_FPS)  # 每秒幀數
-    frame_count = 0
+    print(f"找到 {len(image_files)} 張 Mask 圖片，開始對應原圖處理...")
     
     file_names = []
     no_ui_frames = []
     line_frames = []
     
-    while True:
-        ret, frame = cap.read() # 讀取一幀
-        if not ret:
-            break  # 讀到結尾
-        
-        frame_count += 1
-        
-        # 每 50 幀處理一次
-        if frame_count % 50 != 0:
-            continue
-        
-        # 900 * 700
-        # image_h, image_w = frame.shape[:2]
-        image_h, image_w = 700, 900
-        x1, y1 = 80, 100
-        x2, y2 = 980, 800
-        
-        cropped = frame[y1:y2, x1:x2]
 
-        # 計算當前幀對應的時間戳（秒）
-        time_in_sec = frame_count / fps
-        timestamp_str = f"frame_{time_in_sec:.2f}s.png"
-        filename = output_name + f"_{time_in_sec:.2f}s.png" if output_name else timestamp_str
-        # line_path = os.path.join(output_line_dir, output_name + f"_{time_in_sec:.2f}s_line.png") if output_name else os.path.join(output_line_dir, f"_{time_in_sec:.2f}s_line.png")
+    for filename in image_files:
+        # ======= 讀取圖像 ======= 
+        img_path = os.path.join(input_dir, filename)
+        frame = cv2.imread(img_path)
         
+        image_h, image_w = 700, 900
         
-        line = detected_line(cropped, filename)
-        result = remove_green_red(cropped)
+        line = detected_line(frame, filename)
+        result = remove_green_red(frame)
         result = resize_with_padding(result, 224)
         enhanced = apply_clahe(cv2.cvtColor(result, cv2.COLOR_BGR2GRAY))         
 
         # 儲存圖片
-        statue = save_and_classify_frame(cropped)
+        statue = save_and_classify_frame(frame)
         if statue == "no_ui":
             no_ui_frames.append(enhanced)
             line_frames.append(line)
             file_names.append(filename)
-
-    cap.release()
+            # cv2.imwrite(os.path.join("output/line", filename), line)
+            # cv2.imwrite(os.path.join("output/Img", filename), enhanced)
+            
     return no_ui_frames, line_frames, file_names, image_h, image_w
 
-# input_folder = "data3"
-# for filename in os.listdir(input_folder):
-#     output_folder = "output/Img/"
-#     output_line_folder = "output/line"
-#     os.makedirs(output_folder, exist_ok=True)
-#     os.makedirs(output_line_folder, exist_ok=True)
-#     video_path = os.path.join(input_folder, filename)
-#     extract_frames_with_timestamp(video_path, output_folder, output_line_folder, output_name="data3_" + filename.split(".")[0])
+# input_folder = "input_data\\input_image\\data3"
+# output_folder = "output/Img"
+# output_line_folder = "output/line"
+# os.makedirs(output_folder, exist_ok=True)
+# os.makedirs(output_line_folder, exist_ok=True)
+# extract_frames_with_timestamp(input_folder)
+# print("處理完成！")
