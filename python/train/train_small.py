@@ -162,7 +162,7 @@ if __name__ == "__main__":
     MODEL_PATH = os.path.join(BASE_DIR, "model/mobilenet_small_unet_last_train237_v456_test1.h5")
     TEST_DIR   = os.path.join(BASE_DIR, "test_data")
     PRED_DIR = os.path.join(BASE_DIR, "pred_mask/predictions_output_small_last_train237_v456_test1_noearly")
-    VIDEO_DIR  = os.path.join(BASE_DIR, "input_data/data1")
+    INPUT_DIR  = os.path.join(BASE_DIR, "input_data/input_image/data1")
     OUTPUT_DIR   = os.path.join(BASE_DIR, "result/line_small")
 
     os.makedirs(PRED_DIR, exist_ok=True)
@@ -171,16 +171,14 @@ if __name__ == "__main__":
     
     pre_start_time = time.perf_counter()
     frames ={}
-    for filename in os.listdir(VIDEO_DIR):
-        video_path = os.path.join(VIDEO_DIR, filename)
-        no_ui_frames, line_frames, file_names, image_h, image_w = pre_processor.extract_frames_with_timestamp(video_path, output_name="data1_" + filename.split(".")[0])
+    no_ui_frames, line_frames, file_names, image_h, image_w = pre_processor.extract_frames_with_timestamp(INPUT_DIR)
         
-        for img, line, fname in zip(no_ui_frames, line_frames, file_names):
-            frames[fname] = {
-                "img": img,
-                "line": line,
-                "file_name": fname
-            }
+    for img, line, fname in zip(no_ui_frames, line_frames, file_names):
+        frames[fname] = {
+            "img": img,
+            "line": line,
+            "file_name": fname
+        }
     pre_end_time = time.perf_counter()
     pre_elapsed_time = pre_end_time - pre_start_time
     
