@@ -7,6 +7,7 @@ from skan import Skeleton, summarize
 from skimage.morphology import medial_axis
 from scipy.ndimage import distance_transform_edt, label
 from scipy.interpolate import splprep, splev
+from skimage.feature import hessian_matrix
 
 def resize(img, size):
 
@@ -31,29 +32,6 @@ def crop(img, x1, x2, y1, y2):
     cropped = img[y1:y2, x1:x2]
 
     return cropped
-
-def detected_line(img):
-
-    # ====== 建立彩色範圍 ======
-    lower_green = np.array([0, 0, 200])
-    upper_green = np.array([0, 0, 255])
-
-    # ====== 抓取符合色彩範圍內的像素成為新影像 ======
-    mask = cv2.inRange(img, lower_green, upper_green) 
-    
-    green_points = np.where(mask == 255)
-    
-    if len(green_points[0]) > 0:
-        # 將座標轉換成 (x, y) 的列表
-        all_points = list(zip(green_points[1], green_points[0]))
-        
-        # 找出最上方的點（Y最小）和最下方的點（Y最大）
-        p_top = min(all_points, key=lambda p: p[1])
-        p_bottom = max(all_points, key=lambda p: p[1])
-        
-        return p_top, p_bottom
-    
-    return None, None
 
 def is_valid_centerline(x_pts, y_pts, img_w=224):
     """ 判定中心線合法性並過濾雜訊 """
@@ -209,8 +187,8 @@ def find_RangeGate(start_pt, target_pt, img):
             
         # 偵測交界點
         if img[curr_y, curr_x] == 0:
-            final_x = int(round(curr_x - ux))
-            final_y = int(round(curr_y - uy))
+            final_x = int(round(curr_x - ux * 2))
+            final_y = int(round(curr_y - uy * 2))
             
             # 檢查是否還在影像內
             final_x = max(0, min(w - 1, final_x))
@@ -461,7 +439,8 @@ def post_process(frames, image_h, image_w, output_dir):
             continue 
         
         #  ======= 找線的端點 ======= 
-        p_top, p_bottom = detected_line(line)
+        p_top, p_bottom = line[0], line[1]
+        print(f"線段端點: {p_top}, {p_bottom}, type: {type(p_top)}, {type(p_bottom)}")
         if p_top is None or p_bottom is None:
             print(f"{fname} 未能偵測到線段")
             continue
@@ -551,19 +530,17 @@ def post_process(frames, image_h, image_w, output_dir):
         cv2.line(result, p_top, intersection_top, (0, 255, 0), 1)
         cv2.line(result, intersection_bottom, p_bottom, (0, 255, 0), 1)
         angle = calculate_angle_between_vectors(intersection_bottom, intersection_top, direction, absolute=True)
+        angle_abs = calculate_angle_between_vectors((0,0), (0,1), direction, absolute=True)
 
         # ===== 存檔 =====
         save_path = os.path.join(output_dir, fname)
         cv2.imwrite(save_path, result)
         
         # print(f"{filename} | {time.perf_counter()-start:.3f}s | intersection: {len(points_list)}")
-        print(f"{fname} | Angle:  angle: {angle:.2f} degree | Range Gate: {intersection_top}, {intersection_bottom} | center: {center}")
+        print(f"{fname} | Angle: {angle_abs} | 夾角: {angle:.2f} | center: {center}")
         # print(f"p: {p_top}, {p_bottom} | intersection: {intersection_top}, {intersection_bottom} | center: {center} | len(points_list): {len(points_list)}")
 
     print("\n=== 全部處理完成 ===")
-    
-    
-    
     
 # base_line_dir = r"C:\collega\Project\data\dealData_post\line\data5"
 # base_mask_dir = r"C:\collega\Project\data\dealData_post\masks_cleaned"
