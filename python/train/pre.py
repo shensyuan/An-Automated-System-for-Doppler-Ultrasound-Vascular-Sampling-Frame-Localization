@@ -75,146 +75,56 @@ def resize_with_padding(img, size):
 
     return padded
 
-def resize(img, size):
-
-    h, w = img.shape[:2]
-
-    # 計算縮放比例
-    scale = size / min(h, w)
-
-    if scale > 1.0:
-        scale = 1.0
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    # resize
-    resized = cv2.resize(img, (new_w, new_h))
-
-    return resized
-
-def center_crop(img, size):
-
-    h, w = img.shape[:2]
-
-    # size = min(h, w)
-
-    start_x = (w - size) // 2
-    start_y = (h - size) // 2
-
-    crop = img[start_y:start_y+size, start_x:start_x+size]
-
-    return crop
-
-def save_and_classify_frame(original_frame):
-
-    h, w = original_frame.shape[:2]
-
-    # 只抓右上角區域
-    roi = original_frame[0:int(h*0.15), int(w*0.75):w]
-
-    if roi.size == 0:
-        return
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    # ========= 1. 偵測白色文字 =========
-    _, white_mask = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY)
-    white_pixels = cv2.countNonZero(white_mask)
-
-    # ========= 2. 偵測黑色背景 =========
-    _, black_mask = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY_INV)
-    black_pixels = cv2.countNonZero(black_mask)
-
-    # ========= 3. 找文字輪廓 =========
-    contours, _ = cv2.findContours(
-        white_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    text_like_contours = 0
-
-    for cnt in contours:
-        x,y,wc,hc = cv2.boundingRect(cnt)
-
-        # 過濾太小的 noise
-        if 5 < wc < 80 and 5 < hc < 40:
-            text_like_contours += 1
-
-    # ========= Debug =========
-    # print(frame_name, white_pixels, black_pixels, text_like_contours)
-
-    # ========= 判斷 UI =========
-    if (
-        white_pixels > 80 and
-        black_pixels > 300 and
-        text_like_contours >= 2
-    ):
-        return "with_ui"
-    else:
-        return "no_ui"
-
-def detected_line(img, filename):
-
+def detected_line(img):
     # ====== 建立彩色範圍 ======
     lower_green = np.array([30, 130, 30])
     upper_green = np.array([95, 255, 255])
 
     # ====== 抓取符合色彩範圍內的像素成為新影像 ======
     mask = cv2.inRange(img, lower_green, upper_green) 
-
-    mask = cv2.ximgproc.thinning(mask, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
-
-    # ====== 形態學處理 ====== 
-    kernel = np.ones((3, 3), np.uint8)
-    mask_dilated = cv2.dilate(mask, kernel, iterations=1)
-
-    # ====== 偵測所有線段 ====== 
-    # rho=1, theta=1度, threshold=20 (因為片段可能很短，門檻設低一點)
-    lines = cv2.HoughLinesP(
-        mask_dilated, 
-        rho=1, 
-        theta=np.pi/180, 
-        threshold=20, 
-        minLineLength=10, 
-        maxLineGap=50  # 這裡設大一點，讓 OpenCV 嘗試自己連線
-    )
-
-    if lines is not None:
-        all_points = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            all_points.append((x1, y1))
-            all_points.append((x2, y2))
-
-        #  ====== 關鍵步驟：尋找「最遠兩端點」：找 Y 座標最小（最上方）與最大（最下方）的點 ====== 
+    
+    green_points = np.where(mask == 255)
+    
+    if len(green_points[0]) > 0:
+        # 將座標轉換成 (x, y) 的列表
+        all_points = list(zip(green_points[1], green_points[0]))
+        
+        # 找出最上方的點（Y最小）和最下方的點（Y最大）
         p_top = min(all_points, key=lambda p: p[1])
         p_bottom = max(all_points, key=lambda p: p[1])
-
-        # ====== 計算長直線資訊 ====== 
-        x1, y1 = p_top
-        x2, y2 = p_bottom
         
-        length = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-
-        # ====== 繪製結果 ====== 
-        # result_img = img_ori.copy()
-        result_img = np.zeros_like(img)
-        cv2.line(result_img, p_top, p_bottom, (0, 0, 255), 2) 
-        # cv2.circle(result_img, p_top, 5, (0, 255, 0), -1)
-        # cv2.circle(result_img, p_bottom, 5, (0, 255, 0), -1) 
-
-        # print(f"偵測完成！")
-        # print(f"頂點: {p_top}, 底點: {p_bottom}")
-        # print(f"連線總長度: {length:.2f}")
-        # print(f"連線角度: {angle:.2f}")
-
-        return result_img
-    else:
-        print(f"{filename} 未能偵測到線段")
+        dx = p_bottom[0] - p_top[0]
+        dy = p_bottom[1] - p_top[1]
         
-    return img
+        # 銳角（弧度）
+        alpha_rad = math.atan(abs(dx / dy))
+        # 轉換為度
+        alpha_deg = math.degrees(alpha_rad)
+        
+        # 決定正負
+        if dx * dy < 0:  
+            return alpha_deg, p_top[0]
+        else:            
+            return -alpha_deg, p_top[0]
+    
+    return None, None
+
+def get_line_point(top_x, top_y, angle_deg, length):
+    """
+    根據最上方端點、角度和長度，計算最底部端點的座標
+    """
+    top_x = float(top_x)
+    top_y = float(top_y)
+    angle_rad = math.radians(float(angle_deg))
+    length = float(length)
+    
+    dx = math.sin(angle_rad) * length
+    dy = math.cos(angle_rad) * length
+    
+    bottom_x = top_x + dx
+    bottom_y = top_y + dy
+    
+    return int(round(bottom_x)), int(round(bottom_y))
 
 def extract_frames_with_timestamp(input_dir, output_name=None):
 
@@ -233,19 +143,28 @@ def extract_frames_with_timestamp(input_dir, output_name=None):
         img_path = os.path.join(input_dir, filename)
         frame = cv2.imread(img_path)
         
-        image_h, image_w = 700, 900
+        image_h, image_w = frame.shape[:2]
         
-        line = detected_line(frame, filename)
+        line = [(0, 0), (0, 0)]
+        line_angel, top_x = detected_line(frame)
+        print(f"{filename} 角度: {line_angel}, top_x: {top_x}")
+        
+        if line_angel is None or top_x is None:
+            print(f"{filename} 未能偵測到線段，跳過")
+        else:
+            line[0] = (top_x, 0)
+            line[1] = get_line_point(line[0][0], line[0][1], line_angel, image_h)
+
         result = remove_green_red(frame)
         result = resize_with_padding(result, 224)
         enhanced = apply_clahe(cv2.cvtColor(result, cv2.COLOR_BGR2GRAY))         
 
         # 儲存圖片
-        statue = save_and_classify_frame(frame)
-        if statue == "no_ui":
-            no_ui_frames.append(enhanced)
-            line_frames.append(line)
-            file_names.append(filename)
+        # statue = classify_frame(frame)
+        # if statue == "no_ui":
+        no_ui_frames.append(enhanced)
+        line_frames.append(line)
+        file_names.append(filename)
             # cv2.imwrite(os.path.join("output/line", filename), line)
             # cv2.imwrite(os.path.join("output/Img", filename), enhanced)
             
