@@ -129,13 +129,11 @@ if __name__ == "__main__":
     
     # C:\collega\Project\data\train\test_data\test_masks
     BASE_DIR   = "C:\\collega\\Project\\data\\train"
-    VIDEO_DIR  = os.path.join(BASE_DIR, "input_data/data3")
     TEST_DIR   = os.path.join(BASE_DIR, "test_data")
-    LINE_DIR   = os.path.join(TEST_DIR, "line")
     MODEL_PATH = os.path.join(BASE_DIR, "model/vessel_lumen_mobilenet_large_unet.h5")
-    PRED_DIR   = os.path.join(BASE_DIR, "pred_mask")
-    PRED_DIR   = os.path.join(PRED_DIR, "predictions_output_large")
+    PRED_DIR   = os.path.join(BASE_DIR, "pred_mask/predictions_output_large")
     OUTPUT_DIR   = os.path.join(BASE_DIR, "result/line_large")
+    INPUT_DIR  = os.path.join(BASE_DIR, "input_data/input_image/data3")
     
     frames ={}
     # filenames = []
@@ -143,24 +141,14 @@ if __name__ == "__main__":
     # all_frames = []
     
     pre_start_time = time.perf_counter()
-    for filename in os.listdir(VIDEO_DIR):
-        # output_folder = os.path.join(TEST_DIR, "test_images")
-        # output_line_folder = LINE_DIR
-        # os.makedirs(output_folder, exist_ok=True)
-        # os.makedirs(output_line_folder, exist_ok=True)  
-        video_path = os.path.join(VIDEO_DIR, filename)
-        no_ui_frames, line_frames, file_names, image_h, image_w = pre_processor.extract_frames_with_timestamp(video_path, output_name="data3_" + filename.split(".")[0])
+    no_ui_frames, line_frames, file_names, image_h, image_w = pre_processor.extract_frames_with_timestamp(INPUT_DIR)
         
-        # filenames.extend(file_names)
-        # all_line_frames.extend(line_frames)
-        # all_frames.extend(no_ui_frames)
-        
-        for img, line, fname in zip(no_ui_frames, line_frames, file_names):
-            frames[fname] = {
-                "img": img,
-                "line": line,
-                "file_name": fname
-            }
+    for img, line, fname in zip(no_ui_frames, line_frames, file_names):
+        frames[fname] = {
+            "img": img,
+            "line": line,
+            "file_name": fname
+        }
         
     pre_end_time = time.perf_counter()
     pre_elapsed_time = pre_end_time - pre_start_time
