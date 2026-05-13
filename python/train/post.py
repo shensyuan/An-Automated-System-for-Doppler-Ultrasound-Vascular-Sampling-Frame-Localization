@@ -3,11 +3,9 @@ import cv2
 import os
 import time
 import numpy as np
-from skan import Skeleton, summarize
 from skimage.morphology import medial_axis
 from scipy.ndimage import distance_transform_edt, label
 from scipy.interpolate import splprep, splev
-from skimage.feature import hessian_matrix
 
 def resize(img, size):
 
@@ -271,59 +269,78 @@ def get_absolute_angle(v, relative_angle_deg):
     
     return final_angle_deg
 
-def get_direction_by_skan(skeleton_cv, target_point):
+def get_tangent_direction(skeleton, point, window_size=15):
     """
-    利用 Skan 找到離目標點最近的路徑，並回傳方向向量 (dx, dy)
+    用PCA獲取骨架上某點的切線方向
+    Returns:
+        direction: 切線方向向量 (dx, dy)，永遠有效（不會是 None）
     """
+    x0, y0 = point
+    h, w = skeleton.shape
+
+    # ===== 直接在函式內檢查 =====
+    # 檢查1: skeleton 是否有效
+    if skeleton is None or skeleton.size == 0:
+        print("Warning: skeleton 為空")
+        return np.array([1.0, 0.0])  # 直接回傳預設值
+    
+    # 檢查2: 點是否在範圍內
+    if not (0 <= x0 < w and 0 <= y0 < h):
+        print(f"Warning: 點 ({x0}, {y0}) 超出圖像範圍")
+        return np.array([1.0, 0.0])
+    
+    # 檢查3: 點是否在骨架上（選用）
+    if skeleton[y0, x0] == 0:
+        print(f"Warning: 點 ({x0}, {y0}) 不在骨架上")
+        # 可以選擇找最近的骨架點，或直接回傳預設值
+        return np.array([1.0, 0.0])
+
+    # 取 ROI
+    x1 = max(0, x0 - window_size)
+    x2 = min(w, x0 + window_size)
+    y1 = max(0, y0 - window_size)
+    y2 = min(h, y0 + window_size)
+
+    roi = skeleton[y1:y2, x1:x2]
+
+    # 找 skeleton 點
+    ys, xs = np.where(roi > 0)
+
+    # 檢查4: 點數是否足夠
+    if len(xs) < 2:
+        print(f"Warning: 點 {point} 鄰域內只有 {len(xs)} 個骨架點")
+        return np.array([1.0, 0.0])
+
+    # 轉回全圖座標
+    xs = xs + x1
+    ys = ys + y1
+    points = np.column_stack((xs, ys)).astype(np.float32)
+
     try:
-        # 建立 Skan 骨架物件
-        skel = Skeleton(skeleton_cv > 0)
-        stats = summarize(skel, separator='_')
+        mean = np.mean(points, axis=0)
+        centered = points - mean
         
-        if stats.empty:
-            print("Skan 沒有找到任何路徑，回傳水平向量")
-            return np.array([1, 0]) # 預防萬一回傳水平向量
-
-        # 1. 獲取整段 skel 的所有路徑座標
-        all_coords = []
-        for path_idx in stats.index:
-            coords = skel.path_coordinates(path_idx)
-            all_coords.extend(coords)
-        path_coords = np.array(all_coords)  # [row, col] 格式
-
-        # 2. 找到路徑上距離 target_point 最近的點的索引
-        p_target = np.array([target_point[1], target_point[0]])
-        dists = np.linalg.norm(path_coords - p_target, axis=1)
-        nearest_idx = np.argmin(dists)
-
-        # 3. 取鄰域點計算向量 (前後各 5 點以平滑鋸齒)
-        idx_start = max(0, nearest_idx - 5)
-        idx_end = min(len(path_coords) - 1, nearest_idx + 5)
-
-        p_start = path_coords[idx_start]
-        p_end = path_coords[idx_end]
+        # 檢查5: 是否所有點相同
+        if np.all(centered == 0):
+            print(f"Warning: 點 {point} 鄰域內所有點重合")
+            return np.array([1.0, 0.0])
         
-        # 4. 計算向量
-        # dr = y 變化量, dc = x 變化量
-        dr = p_end[0] - p_start[0]
-        dc = p_end[1] - p_start[1]
-        
-        # 正規化為單位向量 (dx, dy)
-        magnitude = np.sqrt(dr**2 + dc**2)
-        if magnitude == 0:
-            return np.array([1, 0])
-            
-        # 注意順序：我們回傳 (dx, dy)，對應 (dc, dr)
-        direction = np.array([dc / magnitude, dr / magnitude])
+        _, _, vt = np.linalg.svd(centered)
+        direction = vt[0]
         
         if direction[0] > 0:
-            return -direction
+            direction = -direction
         
-        return direction 
-
+        # 正規化
+        norm = np.linalg.norm(direction)
+        if norm > 0:
+            return direction / norm
+        else:
+            return np.array([1.0, 0.0])
+            
     except Exception as e:
-        print(f"Skan 方向計算失敗: {e}")
-        return np.array([1, 0])
+        print(f"Warning: SVD 失敗: {e}")
+        return np.array([1.0, 0.0]) 
 
 def calculate_angle_between_vectors(p1, p2, v_given, absolute=False):
     """
@@ -440,7 +457,6 @@ def post_process(frames, image_h, image_w, output_dir):
         
         #  ======= 找線的端點 ======= 
         p_top, p_bottom = line[0], line[1]
-        print(f"線段端點: {p_top}, {p_bottom}, type: {type(p_top)}, {type(p_bottom)}")
         if p_top is None or p_bottom is None:
             print(f"{fname} 未能偵測到線段")
             continue
@@ -462,8 +478,8 @@ def post_process(frames, image_h, image_w, output_dir):
             center = points_list[0]
             
             # ======== Angle ========== 
-            direction = get_direction_by_skan(centerLine, center)
-            
+            direction = get_tangent_direction(centerLine, center)
+
             # ======== range gate ==========
             if len(green_points[0]) > 0:
                 all_points = list(zip(green_points[1], green_points[0]))
@@ -477,18 +493,21 @@ def post_process(frames, image_h, image_w, output_dir):
         if len(points_list) < 1:
             
             # ======== 找中心線中點 ========
-            skel = Skeleton(centerLine > 0)
-            stats = summarize(skel, separator='_')
+            ys, xs = np.where(centerLine > 0)
+    
+            if len(xs) < 20:
+                return None, None
             
-            main_path_idx = stats['branch_distance'].idxmax()
-            path_coords = skel.path_coordinates(main_path_idx) # [row, col]
+            # 1. 取得中點
+            center_x = int(np.median(xs))
+            center_y = int(np.median(ys))
             
-            target_idx = int(len(path_coords) * 0.5)
-            center_r, center_c = path_coords[target_idx]
-            center = (int(center_c), int(center_r))
+            distances = (xs - center_x)**2 + (ys - center_y)**2
+            nearest_idx = np.argmin(distances)
+            center = (int(xs[nearest_idx]), int(ys[nearest_idx]))
             
             # ======== Angle ========
-            direction = get_direction_by_skan(centerLine, center)
+            direction = get_tangent_direction(centerLine, center)
             
             # ======== 預設線段(-75) ========
             p_top, p_bottom = get_boundary_intersection_direct(image.shape, center, get_absolute_angle(direction, 60))
@@ -537,12 +556,7 @@ def post_process(frames, image_h, image_w, output_dir):
         cv2.imwrite(save_path, result)
         
         # print(f"{filename} | {time.perf_counter()-start:.3f}s | intersection: {len(points_list)}")
-        print(f"{fname} | Angle: {angle_abs} | 夾角: {angle:.2f} | center: {center}")
+        print(f"{fname} | Angle: {angle_abs:.2f} | 夾角: {angle:.2f} | center: {center}")
         # print(f"p: {p_top}, {p_bottom} | intersection: {intersection_top}, {intersection_bottom} | center: {center} | len(points_list): {len(points_list)}")
 
     print("\n=== 全部處理完成 ===")
-    
-# base_line_dir = r"C:\collega\Project\data\dealData_post\line\data5"
-# base_mask_dir = r"C:\collega\Project\data\dealData_post\masks_cleaned"
-# base_ori_dir = r"C:\collega\Project\data\dealData_post\images"
-# post_process(base_line_dir, base_mask_dir, base_ori_dir)
