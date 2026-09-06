@@ -1,0 +1,4 @@
+rootProject.name = 'TFLite Super Resolution Demo App'
+include ':app'
+include ':opencv'
+project(':opencv').projectDir = new File(rootDir, 'opencv')
