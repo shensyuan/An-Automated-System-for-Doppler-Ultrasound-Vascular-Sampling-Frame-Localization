@@ -21,15 +21,6 @@
         android:layout_gravity="center"
         android:src="@drawable/icn_chevron_up" />
 
-    <Switch
-        android:id="@+id/switch_use_gpu"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginStart="8dp"
-        android:layout_marginEnd="8dp"
-        android:layout_marginBottom="36dp"
-        android:text="@string/gpu" />
-
     <TextView
         android:id="@+id/log_view"
         android:layout_width="wrap_content"

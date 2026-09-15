@@ -28,28 +28,714 @@
 namespace tflite {
 namespace examples {
 namespace superresolution {
-// TODO: make it changeable in the UI
 constexpr int kThreadNum = 4;
 
-SuperResolution::SuperResolution(const void* model_data, size_t model_size,
-                                 bool use_gpu) {
+#define CV_PI 3.14159265358979323846
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "SuperResolution", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SuperResolution", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SuperResolution", __VA_ARGS__)
+
+// ==================== 前處理 ====================
+/**
+ * 對灰階影像套用 CLAHE（clipLimit=2.0, tile 8×8）做局部對比強化。
+ * @param gray 8-bit 單通道灰階影像
+ * @return 強化後的灰階影像，尺寸與輸入相同
+ */
+cv::Mat SuperResolution::apply_clahe(const cv::Mat& gray) {
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat enhanced;
+    clahe->apply(gray, enhanced);
+    return enhanced;
+}
+
+
+/**
+ * 等比縮放影像使長邊等於 size，短邊兩側補黑邊，輸出 size×size 的正方形影像。
+ * @param img  任意尺寸的輸入影像（通道數不限）
+ * @param size 目標邊長（本專案為 224）
+ * @return size×size 的補邊影像
+ */
+cv::Mat SuperResolution::resize_with_padding(const cv::Mat& img, int size) {
+    int h = img.rows;
+    int w = img.cols;
+
+    double scale = static_cast<double>(size) / static_cast<double>(std::max(h, w));
+
+    int new_w = static_cast<int>(w * scale);
+    int new_h = static_cast<int>(h * scale);
+
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
+
+    int pad_top = (size - new_h) / 2;
+    int pad_bottom = size - new_h - pad_top;
+    int pad_left = (size - new_w) / 2;
+    int pad_right = size - new_w - pad_left;
+
+    cv::Mat padded;
+    cv::copyMakeBorder(resized, padded, pad_top, pad_bottom, pad_left, pad_right,
+                       cv::BORDER_CONSTANT, cv::Scalar(0));
+
+    return padded;
+}
+
+
+/**
+ * 由線段頂端點、角度與長度，計算線段另一端（下端）的座標。
+ * 角度定義：垂直向下為 0°，往右偏為正（dx = sin, dy = cos）。
+ * @param top_x     頂端點 x
+ * @param top_y     頂端點 y
+ * @param angle_deg 線段相對垂直方向的角度（度）
+ * @param length    線段長度（像素）
+ * @return 下端點座標（四捨五入為整數）
+ */
+cv::Point SuperResolution::get_line_point(int top_x, int top_y, double angle_deg, int length) {
+    double angle_rad = angle_deg * CV_PI / 180.0;
+    double dx = std::sin(angle_rad) * length;
+    double dy = std::cos(angle_rad) * length;
+
+    int bottom_x = static_cast<int>(std::round(top_x + dx));
+    int bottom_y = static_cast<int>(std::round(top_y + dy));
+
+    return cv::Point(bottom_x, bottom_y);
+}
+
+// ==================== 後處理 ====================
+/**
+ * 等比縮放影像使「短邊」等於 size（長邊依比例放大，不補邊、不裁切）。
+ * @param img  輸入影像
+ * @param size 目標短邊長度
+ * @return 縮放後影像
+ */
+cv::Mat SuperResolution::resize_img(const cv::Mat& img, int size) {
+    int h = img.rows;
+    int w = img.cols;
+    double scale = static_cast<double>(size) / std::min(h, w);
+    int new_w = static_cast<int>(w * scale);
+    int new_h = static_cast<int>(h * scale);
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
+    return resized;
+}
+
+/**
+ * 裁切影像的矩形區域 [x1, x2) × [y1, y2)。
+ * @param img 輸入影像
+ * @param x1  左邊界（含）
+ * @param x2  右邊界（不含）
+ * @param y1  上邊界（含）
+ * @param y2  下邊界（不含）
+ * @return 裁切後的獨立副本（clone）
+ */
+cv::Mat SuperResolution::crop_img(const cv::Mat& img, int x1, int x2, int y1, int y2) {
+    return img(cv::Range(y1, y2), cv::Range(x1, x2)).clone();
+}
+
+/**
+ * Zhang-Suen 細線化：把二值 mask 迭代削薄成單像素寬的骨架。
+ * @param src 輸入 mask（>127 視為前景；若為彩色會先轉灰階）
+ * @param dst 輸出骨架（CV_8UC1，前景 255 / 背景 0），與 src 同尺寸
+ */
+void SuperResolution::thinningZhangSuen(const cv::Mat& src, cv::Mat& dst) {
+    dst = src.clone();
+    if (dst.channels() > 1) {
+        cv::cvtColor(dst, dst, cv::COLOR_BGR2GRAY);
+    }
+    cv::threshold(dst, dst, 127, 255, cv::THRESH_BINARY);
+
+    cv::Mat prev = cv::Mat::zeros(dst.size(), CV_8UC1);
+    cv::Mat diff;
+    std::vector<cv::Point> toDelete;
+
+    do {
+        // Step 1
+        toDelete.clear();
+        for (int i = 1; i < dst.rows - 1; i++) {
+            for (int j = 1; j < dst.cols - 1; j++) {
+                if (dst.at<uchar>(i, j) == 0) continue;
+
+                uchar p2 = dst.at<uchar>(i, j + 1) / 255;
+                uchar p3 = dst.at<uchar>(i + 1, j + 1) / 255;
+                uchar p4 = dst.at<uchar>(i + 1, j) / 255;
+                uchar p5 = dst.at<uchar>(i + 1, j - 1) / 255;
+                uchar p6 = dst.at<uchar>(i, j - 1) / 255;
+                uchar p7 = dst.at<uchar>(i - 1, j - 1) / 255;
+                uchar p8 = dst.at<uchar>(i - 1, j) / 255;
+                uchar p9 = dst.at<uchar>(i - 1, j + 1) / 255;
+
+                int P1 = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+                int S = 0;
+                if (p2 == 0 && p3 == 1) S++;
+                if (p3 == 0 && p4 == 1) S++;
+                if (p4 == 0 && p5 == 1) S++;
+                if (p5 == 0 && p6 == 1) S++;
+                if (p6 == 0 && p7 == 1) S++;
+                if (p7 == 0 && p8 == 1) S++;
+                if (p8 == 0 && p9 == 1) S++;
+                if (p9 == 0 && p2 == 1) S++;
+
+                if (P1 >= 2 && P1 <= 6 && S == 1 &&
+                    p2 * p4 * p6 == 0 && p4 * p6 * p8 == 0) {
+                    toDelete.push_back(cv::Point(j, i));
+                }
+            }
+        }
+        for (const auto& pt : toDelete) {
+            dst.at<uchar>(pt.y, pt.x) = 0;
+        }
+
+        // Step 2
+        toDelete.clear();
+        for (int i = 1; i < dst.rows - 1; i++) {
+            for (int j = 1; j < dst.cols - 1; j++) {
+                if (dst.at<uchar>(i, j) == 0) continue;
+
+                uchar p2 = dst.at<uchar>(i, j + 1) / 255;
+                uchar p3 = dst.at<uchar>(i + 1, j + 1) / 255;
+                uchar p4 = dst.at<uchar>(i + 1, j) / 255;
+                uchar p5 = dst.at<uchar>(i + 1, j - 1) / 255;
+                uchar p6 = dst.at<uchar>(i, j - 1) / 255;
+                uchar p7 = dst.at<uchar>(i - 1, j - 1) / 255;
+                uchar p8 = dst.at<uchar>(i - 1, j) / 255;
+                uchar p9 = dst.at<uchar>(i - 1, j + 1) / 255;
+
+                int P1 = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+                int S = 0;
+                if (p2 == 0 && p3 == 1) S++;
+                if (p3 == 0 && p4 == 1) S++;
+                if (p4 == 0 && p5 == 1) S++;
+                if (p5 == 0 && p6 == 1) S++;
+                if (p6 == 0 && p7 == 1) S++;
+                if (p7 == 0 && p8 == 1) S++;
+                if (p8 == 0 && p9 == 1) S++;
+                if (p9 == 0 && p2 == 1) S++;
+
+                if (P1 >= 2 && P1 <= 6 && S == 1 &&
+                    p2 * p4 * p8 == 0 && p2 * p6 * p8 == 0) {
+                    toDelete.push_back(cv::Point(j, i));
+                }
+            }
+        }
+        for (const auto& pt : toDelete) {
+            dst.at<uchar>(pt.y, pt.x) = 0;
+        }
+
+        cv::absdiff(dst, prev, diff);
+        dst.copyTo(prev);
+    } while (cv::countNonZero(diff) > 0);
+}
+
+/**
+ * 判斷一條候選中心線是否合理，過濾掉太短、太窄或上下抖動過大的片段。
+ * 條件：點數 ≥ 15、x 方向跨度 ≥ 20 px、相鄰點 |Δy| 總和 / 寬度 ≤ 1.5。
+ * @param x_pts 依 x 排序的中心線各點 x 座標
+ * @param y_pts 對應的 y 座標
+ * @return 通過檢查回傳 true
+ */
+bool SuperResolution::is_valid_centerline(const std::vector<int>& x_pts, const std::vector<int>& y_pts) {
+    if (static_cast<int>(x_pts.size()) < 15) return false;
+
+    int min_x = *std::min_element(x_pts.begin(), x_pts.end());
+    int max_x = *std::max_element(x_pts.begin(), x_pts.end());
+    int width = max_x - min_x;
+
+    double y_variability = 0.0;
+    for (size_t i = 1; i < y_pts.size(); i++) {
+        y_variability += std::abs(y_pts[i] - y_pts[i - 1]);
+    }
+    y_variability /= (width + 1e-6);
+
+    if (width < 20) return false;
+    if (y_variability > 1.5) return false;
+
+    return true;
+}
+
+/**
+ * 計算 Catmull-Rom 樣條在四個控制點 p0~p3 之間、參數 t 處的位置（曲線段落在 p1~p2 之間）。
+ * @param p0 前一控制點
+ * @param p1 段起點
+ * @param p2 段終點
+ * @param p3 後一控制點
+ * @param t  段內參數，0~1
+ * @return 曲線上的點
+ */
+cv::Point2f SuperResolution::catmullRomPoint(const cv::Point2f& p0, const cv::Point2f& p1,
+                                             const cv::Point2f& p2, const cv::Point2f& p3, float t) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+
+    float x = 0.5f * ((2.0f * p1.x) +
+                      (-p0.x + p2.x) * t +
+                      (2.0f * p0.x - 5.0f * p1.x + 4.0f * p2.x - p3.x) * t2 +
+                      (-p0.x + 3.0f * p1.x - 3.0f * p2.x + p3.x) * t3);
+    float y = 0.5f * ((2.0f * p1.y) +
+                      (-p0.y + p2.y) * t +
+                      (2.0f * p0.y - 5.0f * p1.y + 4.0f * p2.y - p3.y) * t2 +
+                      (-p0.y + 3.0f * p1.y - 3.0f * p2.y + p3.y) * t3);
+
+    return cv::Point2f(x, y);
+}
+
+/**
+ * 用 Catmull-Rom 樣條把一串控制點內插成平滑曲線上的密集取樣點。
+ * 控制點只有 2 個時退化為線性內插；首尾段以外推的虛擬控制點補齊。
+ * @param controlPoints 依序排列的控制點（至少 2 個，否則回傳空陣列）
+ * @param totalPoints   輸出點總數（平均分配到各段）
+ * @return 曲線上的取樣點
+ */
+std::vector<cv::Point2f> SuperResolution::generateSplinePoints(const std::vector<cv::Point2f>& controlPoints, int totalPoints) {
+    std::vector<cv::Point2f> result;
+    int n = static_cast<int>(controlPoints.size());
+    if (n < 2) return result;
+
+    if (n == 2) {
+        for (int i = 0; i < totalPoints; i++) {
+            float t = static_cast<float>(i) / (totalPoints - 1);
+            float x = controlPoints[0].x + t * (controlPoints[1].x - controlPoints[0].x);
+            float y = controlPoints[0].y + t * (controlPoints[1].y - controlPoints[0].y);
+            result.push_back(cv::Point2f(x, y));
+        }
+        return result;
+    }
+
+    int segments = n - 1;
+    int pointsPerSegment = totalPoints / segments;
+    int extra = totalPoints - pointsPerSegment * segments;
+
+    for (int seg = 0; seg < segments; seg++) {
+        cv::Point2f p0, p1, p2, p3;
+        p1 = controlPoints[seg];
+        p2 = controlPoints[seg + 1];
+
+        if (seg == 0) {
+            p0 = p1 - (p2 - p1);
+        } else {
+            p0 = controlPoints[seg - 1];
+        }
+
+        if (seg + 2 < n) {
+            p3 = controlPoints[seg + 2];
+        } else {
+            p3 = p2 + (p2 - p1);
+        }
+
+        int nPts = pointsPerSegment + (seg < extra ? 1 : 0);
+        for (int j = 0; j < nPts; j++) {
+            float t = static_cast<float>(j) / nPts;
+            result.push_back(catmullRomPoint(p0, p1, p2, p3, t));
+        }
+    }
+
+    return result;
+}
+
+/**
+ * 從 224×224 的分割 mask 擷取血管中心線，並放大到原圖尺寸。
+ * 流程：二值化 → 8 連通元件（<20 px 略過）→ 距離轉換 → Zhang-Suen 骨架 →
+ * 每個 x 欄取距離值最大的骨架點 → is_valid_centerline 篩選 → 座標縮放到原圖 →
+ * Catmull-Rom 樣條內插 2000 點畫進輸出 mask。
+ * @param img_orig 原圖（只用其尺寸決定輸出大小與縮放比例）
+ * @param mask_224 模型輸出的 224×224 mask（CV_8UC1）
+ * @return 與 img_orig 同尺寸的中心線 mask（CV_8UC1，中心線為 255）
+ */
+cv::Mat SuperResolution::process_single_centerline(const cv::Mat& img_orig, const cv::Mat& mask_224) {
+    int h_orig = img_orig.rows;
+    int w_orig = img_orig.cols;
+    double scale_x = static_cast<double>(w_orig) / 224.0;
+    double scale_y = static_cast<double>(h_orig) / 224.0;
+
+    cv::Mat centerline_mask = cv::Mat::zeros(h_orig, w_orig, CV_8UC1);
+
+    cv::Mat binary_mask;
+    cv::threshold(mask_224, binary_mask, 127, 255, cv::THRESH_BINARY);
+
+    cv::Mat labeled_array;
+    int num_features = cv::connectedComponents(binary_mask, labeled_array, 8, CV_32S);
+
+    for (int i = 1; i <= num_features; i++) {
+        cv::Mat single_region = (labeled_array == i);
+        if (cv::countNonZero(single_region) < 20) continue;
+
+        cv::Mat dist_map;
+        cv::distanceTransform(single_region, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+
+        cv::Mat skel_region;
+        thinningZhangSuen(single_region, skel_region);
+
+        std::vector<cv::Point> skel_points;
+        cv::findNonZero(skel_region, skel_points);
+
+        std::map<int, std::pair<int, float>> region_best_pts;
+        for (const auto& pt : skel_points) {
+            int x = pt.x;
+            int y = pt.y;
+            float val = dist_map.at<float>(y, x);
+            auto it = region_best_pts.find(x);
+            if (it == region_best_pts.end() || val > it->second.second) {
+                region_best_pts[x] = {y, val};
+            }
+        }
+
+        std::vector<int> sorted_x, sorted_y;
+        for (const auto& kv : region_best_pts) {
+            sorted_x.push_back(kv.first);
+            sorted_y.push_back(kv.second.first);
+        }
+
+        if (!is_valid_centerline(sorted_x, sorted_y)) continue;
+
+        std::vector<cv::Point2f> pts_scaled;
+        for (size_t j = 0; j < sorted_x.size(); j++) {
+            pts_scaled.push_back(cv::Point2f(
+                    sorted_x[j] * scale_x,
+                    sorted_y[j] * scale_y
+            ));
+        }
+
+        std::vector<cv::Point2f> fine_pts = generateSplinePoints(pts_scaled, 2000);
+
+        for (const auto& pt : fine_pts) {
+            int ix = static_cast<int>(std::round(pt.x));
+            int iy = static_cast<int>(std::round(pt.y));
+            if (ix >= 0 && ix < w_orig && iy >= 0 && iy < h_orig) {
+                centerline_mask.at<uchar>(iy, ix) = 255;
+            }
+        }
+    }
+
+    return centerline_mask;
+}
+
+/**
+ * 從 start_pt 沿直線往 target_pt 逐像素前進，找到第一個離開血管 mask 的位置（血管邊界）。
+ * 碰到 mask 為 0 的像素時回退 2 px 並 clamp 到影像範圍內作為結果；
+ * 若一路都在 mask 內或走出影像，回傳最後一個有效點。
+ * @param start_pt  起點（通常是中心線與線束的交點）
+ * @param target_pt 目標方向上的點（線束與 mask 的最上 / 最下交點）
+ * @param img       血管 mask（CV_8UC1）
+ * @return 血管邊界點座標
+ */
+cv::Point SuperResolution::find_RangeGate(cv::Point start_pt, cv::Point target_pt, const cv::Mat& img) {
+    int h = img.rows;
+    int w = img.cols;
+    double start_x = static_cast<double>(start_pt.x);
+    double start_y = static_cast<double>(start_pt.y);
+    double target_x = static_cast<double>(target_pt.x);
+    double target_y = static_cast<double>(target_pt.y);
+
+    double dx = target_x - start_x;
+    double dy = target_y - start_y;
+    double distance = std::sqrt(dx * dx + dy * dy);
+
+    if (distance == 0) return start_pt;
+
+    double ux = dx / distance;
+    double uy = dy / distance;
+
+    cv::Point last_pt = start_pt;
+    for (double d = 0.0; d < distance; d += 1.0) {
+        int curr_x = static_cast<int>(start_x + d * ux);
+        int curr_y = static_cast<int>(start_y + d * uy);
+
+        if (!(curr_y >= 0 && curr_y < h && curr_x >= 0 && curr_x < w)) {
+            return last_pt;
+        }
+
+        if (img.at<uchar>(curr_y, curr_x) == 0) {
+            int final_x = static_cast<int>(std::round(curr_x - ux * 2));
+            int final_y = static_cast<int>(std::round(curr_y - uy * 2));
+            final_x = std::max(0, std::min(w - 1, final_x));
+            final_y = std::max(0, std::min(h - 1, final_y));
+            return cv::Point(final_x, final_y);
+        }
+
+        last_pt = cv::Point(curr_x, curr_y);
+    }
+
+    return last_pt;
+}
+
+/**
+ * 通過 center_pt、以 angle_deg 為方向的直線，與影像四邊的兩個交點。
+ * 角度定義：相對 +x 軸、順時針為正（dx = cos, dy = sin）。
+ * @param mask_shape 影像尺寸
+ * @param center_pt  直線通過的點
+ * @param angle_deg  直線方向角（度）
+ * @return {上端點, 下端點}（依 y 座標排序）
+ */
+std::pair<cv::Point, cv::Point> SuperResolution::get_boundary_intersection_direct(cv::Size mask_shape, cv::Point center_pt, double angle_deg) {
+    int h = mask_shape.height;
+    int w = mask_shape.width;
+    double cx = static_cast<double>(center_pt.x);
+    double cy = static_cast<double>(center_pt.y);
+
+    double rad = angle_deg * CV_PI / 180.0;
+    double dx = std::cos(rad);
+    double dy = std::sin(rad);
+
+    std::vector<double> distances;
+    double epsilon = 1e-9;
+
+    if (std::abs(dx) > epsilon) {
+        distances.push_back((0.0 - cx) / dx);
+        distances.push_back((w - 1.0 - cx) / dx);
+    }
+    if (std::abs(dy) > epsilon) {
+        distances.push_back((0.0 - cy) / dy);
+        distances.push_back((h - 1.0 - cy) / dy);
+    }
+
+    double t_pos = 1e18;
+    double t_neg = -1e18;
+    for (double t : distances) {
+        if (t > 0 && t < t_pos) t_pos = t;
+        if (t < 0 && t > t_neg) t_neg = t;
+    }
+
+    cv::Point pt_edge_1(
+            static_cast<int>(cx + t_pos * dx),
+            static_cast<int>(cy + t_pos * dy)
+    );
+    cv::Point pt_edge_2(
+            static_cast<int>(cx + t_neg * dx),
+            static_cast<int>(cy + t_neg * dy)
+    );
+
+    cv::Point p_top, p_bottom;
+    if (pt_edge_1.y > pt_edge_2.y) {
+        p_bottom = pt_edge_1;
+        p_top = pt_edge_2;
+    } else {
+        p_bottom = pt_edge_2;
+        p_top = pt_edge_1;
+    }
+
+    return {p_top, p_bottom};
+}
+
+/**
+ * 以 PCA（SVD）估計骨架上某點的切線方向：取 point 周圍 ±window_size 的骨架點，
+ * 對其座標去均值後做 SVD，第一主成分即切線方向。方向統一翻轉成 x ≤ 0 並正規化。
+ * @param skeleton    中心線 mask（CV_8UC1）
+ * @param point       要估計切線的點（需在骨架上）
+ * @param window_size 取樣視窗半徑（像素）
+ * @return 單位切線向量；point 不在骨架上、越界或視窗內點數 < 2 時回傳 (1, 0)
+ */
+cv::Point2f SuperResolution::get_tangent_direction(const cv::Mat& skeleton, cv::Point point, int window_size) {
+    int x0 = point.x;
+    int y0 = point.y;
+    int h = skeleton.rows;
+    int w = skeleton.cols;
+
+    if (skeleton.empty()) {
+        return cv::Point2f(1.0f, 0.0f);
+    }
+
+    if (!(x0 >= 0 && x0 < w && y0 >= 0 && y0 < h)) {
+        return cv::Point2f(1.0f, 0.0f);
+    }
+
+    if (skeleton.at<uchar>(y0, x0) == 0) {
+        return cv::Point2f(1.0f, 0.0f);
+    }
+
+    int x1 = std::max(0, x0 - window_size);
+    int x2 = std::min(w, x0 + window_size);
+    int y1 = std::max(0, y0 - window_size);
+    int y2 = std::min(h, y0 + window_size);
+
+    cv::Mat roi = skeleton(cv::Range(y1, y2), cv::Range(x1, x2));
+
+    std::vector<cv::Point> roi_points;
+    cv::findNonZero(roi, roi_points);
+
+    if (roi_points.size() < 2) {
+        return cv::Point2f(1.0f, 0.0f);
+    }
+
+    cv::Mat points_mat(static_cast<int>(roi_points.size()), 2, CV_32F);
+    for (size_t i = 0; i < roi_points.size(); i++) {
+        points_mat.at<float>(static_cast<int>(i), 0) = static_cast<float>(roi_points[i].x + x1);
+        points_mat.at<float>(static_cast<int>(i), 1) = static_cast<float>(roi_points[i].y + y1);
+    }
+
+    cv::Mat mean;
+    cv::reduce(points_mat, mean, 0, cv::REDUCE_AVG);
+    cv::Mat centered = points_mat - cv::repeat(mean, points_mat.rows, 1);
+
+    if (cv::norm(centered, cv::NORM_L2) < 1e-6f) {
+        return cv::Point2f(1.0f, 0.0f);
+    }
+
+    cv::Mat svd_w, u, vt;
+    cv::Mat float_src;
+    centered.convertTo(float_src, CV_32F);
+    cv::SVD::compute(float_src, svd_w, u, vt, cv::SVD::FULL_UV);
+
+    cv::Point2f direction(vt.at<float>(0, 0), vt.at<float>(0, 1));
+
+    if (direction.x > 0) {
+        direction = -direction;
+    }
+
+    float norm = std::sqrt(direction.x * direction.x + direction.y * direction.y);
+    if (norm > 0) {
+        direction.x /= norm;
+        direction.y /= norm;
+    } else {
+        direction = cv::Point2f(1.0f, 0.0f);
+    }
+
+    return direction;
+}
+
+/**
+ * 計算線束向量 (p1→p2) 與切線向量 v 的夾角。
+ * 線束角歸約到 0~180°、切線角歸約到 90~270°（y 軸向上為正的座標系）後相減。
+ * @param p1       線束起點
+ * @param p2       線束終點
+ * @param v        切線方向向量
+ * @param absolute false：回傳 0~90° 的銳角；true：回傳歸約後的有號差值（切線角 − 線束角）
+ * @return 夾角（度）
+ */
+double SuperResolution::calculate_angle_between_vectors(cv::Point p1, cv::Point p2, const cv::Point2f& v, bool absolute) {
+    cv::Point2f vec_a(
+            static_cast<float>(p2.x - p1.x),
+            static_cast<float>(p2.y - p1.y)
+    );
+    cv::Point2f vec_b = v;
+
+    LOGD("=== calculate_angle_between_vectors START ===");
+    LOGD("p1: (%d, %d); p2: (%d, %d)", p1.x, p1.y, p2.x, p2.y);
+
+    // 計算原始角度（-180° 到 180°）
+    double angle_a_raw = std::atan2(-vec_a.y, vec_a.x) * 180.0 / M_PI;
+    double angle_b_raw = std::atan2(-vec_b.y, vec_b.x) * 180.0 / M_PI;
+    LOGD("raw angle(beam, direction): %.2f, %.2f", angle_a_raw, angle_b_raw);
+
+    // vector1 歸約到 0~180°
+    double angle_a = std::fmod(angle_a_raw, 180.0);
+    if (angle_a < 0) angle_a += 180.0;
+    if (angle_a >= 180.0) angle_a -= 180.0;
+
+    // vector2 歸約到 90~270°
+    double angle_b = std::fmod(angle_b_raw, 360.0);
+    if (angle_b < 0) angle_b += 360.0;
+
+    // 映射到 [90, 270)
+    if (angle_b < 90.0) {
+        angle_b = angle_b + 180.0;  // 0-90° -> 180-270°
+    } else if(angle_b > 270.0) {
+        angle_b = angle_b - 180.0;  // 270-360° -> 90-180°
+    }
+
+    LOGD("norm angle(beam, direction): %.2f, %.2f", angle_a, angle_b);
+    // 計算 vector2 - vector1
+    double result = angle_b - angle_a;
+
+    if (!absolute) {
+        // 確保結果在 0~180° 之間
+        if (result < 0) result += 180.0;
+        if (result > 180.0) result -= 180.0;
+
+        if (result > 90.0) result = 180.0 - result;
+
+        return result;
+    } else {
+        // 返回原始差值（可能為負）
+        return result;
+    }
+}
+
+/**
+ * 在影像上以 point 為中心、沿 direction 兩側各 length 像素畫一條紅色切線（粗 2）。
+ * @param img       目標影像（BGR，就地繪製）
+ * @param point     切線中心點
+ * @param direction 切線方向（會先正規化）
+ * @param length    單側長度（像素）
+ */
+void SuperResolution::draw_tangent(cv::Mat& img, cv::Point point, const cv::Point2f& direction, int length) {
+    double dx = static_cast<double>(direction.x);
+    double dy = static_cast<double>(direction.y);
+    double norm = std::sqrt(dx * dx + dy * dy);
+    dx /= norm;
+    dy /= norm;
+
+    cv::Point p1(
+            static_cast<int>(point.x - dx * length),
+            static_cast<int>(point.y - dy * length)
+    );
+    cv::Point p2(
+            static_cast<int>(point.x + dx * length),
+            static_cast<int>(point.y + dy * length)
+    );
+
+    cv::line(img, p1, p2, cv::Scalar(0, 0, 255), 2);
+}
+
+/**
+ * 在 point 處畫一條垂直於線段 (line_p1→line_p2) 的短線，總長 length，用來標示 Range Gate。
+ * @param image     目標影像（就地繪製）
+ * @param line_p1   參考線段起點
+ * @param line_p2   參考線段終點
+ * @param point     短線中心點
+ * @param length    短線總長（像素）
+ * @param color     顏色
+ * @param thickness 線寬
+ * @return 短線兩端點 {p1, p2}；參考線段長度為 0 時回傳 {(-1,-1), (-1,-1)} 且不繪製
+ */
+std::pair<cv::Point, cv::Point> SuperResolution::draw_perpendicular_line(cv::Mat& image, cv::Point line_p1, cv::Point line_p2,
+                                                                         cv::Point point, int length, cv::Scalar color, int thickness) {
+    double dx = static_cast<double>(line_p2.x - line_p1.x);
+    double dy = static_cast<double>(line_p2.y - line_p1.y);
+    double line_length = std::sqrt(dx * dx + dy * dy);
+
+    if (line_length == 0) {
+        return {cv::Point(-1, -1), cv::Point(-1, -1)};
+    }
+
+    double ux = dx / line_length;
+    double uy = dy / line_length;
+
+    double perp_x = -uy;
+    double perp_y = ux;
+
+    double half_length = length / 2.0;
+    cv::Point p1(
+            static_cast<int>(point.x + perp_x * half_length),
+            static_cast<int>(point.y + perp_y * half_length)
+    );
+    cv::Point p2(
+            static_cast<int>(point.x - perp_x * half_length),
+            static_cast<int>(point.y - perp_y * half_length)
+    );
+
+    cv::line(image, p1, p2, color, thickness);
+    return {p1, p2};
+}
+
+
+/**
+ * 建構子：由記憶體中的 .tflite 模型建立 TFLite model、options（kThreadNum 執行緒）與 interpreter。
+ * 任一步失敗會記錄錯誤並提早返回，之後可用 IsInterpreterCreated() 檢查。
+ * @param model_data 模型檔內容的起始位址（需在物件存活期間保持有效）
+ * @param model_size 模型大小（bytes）
+ */
+SuperResolution::SuperResolution(const void* model_data, size_t model_size) {
   // Load the model
   model_ = TfLiteModelCreate(model_data, model_size);
   if (!model_) {
     LOGE("Failed to create TFLite model");
     return;
   }
+  LOGD("Model created successfully");
 
   // Create the interpreter options
   options_ = TfLiteInterpreterOptionsCreate();
 
   // Choose CPU or GPU
-  if (use_gpu) {
-    delegate_ = TfLiteGpuDelegateV2Create(/*default options=*/nullptr);
-    TfLiteInterpreterOptionsAddDelegate(options_, delegate_);
-  } else {
-    TfLiteInterpreterOptionsSetNumThreads(options_, kThreadNum);
-  }
+  TfLiteInterpreterOptionsSetNumThreads(options_, kThreadNum);
 
   // Create the interpreter
   interpreter_ = TfLiteInterpreterCreate(model_, options_);
@@ -57,15 +743,18 @@ SuperResolution::SuperResolution(const void* model_data, size_t model_size,
     LOGE("Failed to create TFLite interpreter");
     return;
   }
+
+  LOGD("Number of input tensors: %d", TfLiteInterpreterGetInputTensorCount(interpreter_));
+  LOGD("Number of output tensors: %d", TfLiteInterpreterGetOutputTensorCount(interpreter_));
 }
 
+/**
+ * 解構子：依序釋放 interpreter、options 與 model。
+ */
 SuperResolution::~SuperResolution() {
   // Dispose of the model and interpreter objects
   if (interpreter_) {
     TfLiteInterpreterDelete(interpreter_);
-  }
-  if (delegate_) {
-    TfLiteGpuDelegateV2Delete(delegate_);
   }
   if (options_) {
     TfLiteInterpreterOptionsDelete(options_);
@@ -75,6 +764,9 @@ SuperResolution::~SuperResolution() {
   }
 }
 
+/**
+ * @return interpreter 是否成功建立
+ */
 bool SuperResolution::IsInterpreterCreated() {
   if (!interpreter_) {
     return false;
@@ -82,719 +774,674 @@ bool SuperResolution::IsInterpreterCreated() {
     return true;
   }
 }
-// 前處理
-int** SuperResolution::mat2int(cv::Mat src){
-    int **dst = new int*[src.rows];
-    for(int i = 0 ;i < src.rows; ++i) {
-        dst[i] = new int[src.cols];
-        for(int j = 0; j < src.cols; ++j) {
-            dst[i][j] =src.at<uchar>(i,j);
-        }
-    }
-    return dst;
-}//把mat 的中的灰階直轉到一個int
 
-cv::Mat SuperResolution::int2mat(int** src, int rows, int cols){
-    cv::Mat dst = cv::Mat(rows, cols,CV_8UC1);
-    for (int i = 0; i< rows; i++){
-        for (int j = 0; j< cols; j++){
-            dst.at<uchar>(i,j) = src[i][j];
-        }
-    }
-    return dst;
-}//把int 的中的灰階直轉到mat
-
-// 把1D int array 根據 height width 疊成2D return
-int ** SuperResolution::oneDtotwoD(int * img_1D, int height, int width){
-    int ** img_2D = new int *[height];
-    for (int h = 0; h < height; h++){
-      img_2D[h] = new int [width];
-      for (int w = 0; w < width; w++){
-        img_2D[h][w] = img_1D[h*width+w];
-      }
-    }
-    return img_2D;
-}
-
-// 把2D int array 根據 height width 壓成1D return
-int * SuperResolution::twoDtooneD(int ** img_2D, int height, int width){
-  int * img_1D = new int [height*width];
-  for(int h = 0; h < height; h++){
-    for(int w = 0; w < width; w++){
-      img_1D[h*width+w] = img_2D[h][w];
-    }
-  }
-  return img_1D;
-}
-
-// 丟入2D array 根據左右上下邊界裁切 return 裁切後的2D array
-int ** SuperResolution::InitCrop(int ** oriImg, int cropX0,int cropX1, int cropY0, int cropY1){
-  int height = cropY1-cropY0;
-  int width = cropX1-cropX0;
-  int ** croppedImg = new int*[height];
-  for (int h = 0; h < height; h++){
-    croppedImg[h] = new int [width];
-    for (int w = 0; w < width; w++){
-      croppedImg[h][w] = oriImg[h+cropY0][w+cropX0];
-    }
-  }
-  return croppedImg;
-}
-
-float * SuperResolution::smooth(float* sum, int size, int k){
-    float * result = new float [size];
-    int weight_sum = k*k;
-
-  for (int i = k-1; i < size-k+1; i++){
-    float temp_for_sum = 0;
-    for (int w = 1; w < k; w++){
-      temp_for_sum += (sum[i-w]*(k-w))/weight_sum;
-      temp_for_sum += (sum[i+w]*(k-w))/weight_sum;
-    }
-    temp_for_sum += (sum[i]*k)/weight_sum;
-    result[i] = temp_for_sum;
-  }
-  return result;
-}
-
-int * SuperResolution::get_cropImg_axis(int ** img, int height, int width){
-  //  return: cropLineUp, axis, cropLineDown
-  int * result = new int [3];
-  float * row_sum = new float [height];
-  for (int h = 0; h < height; h++){
-    int sum = 0;
-    for (int w = 0; w < width; w++){
-        sum += img[h][w];
-    }
-    row_sum[h] = static_cast<float>(sum);
-  }
-  float * row_smooth = smooth(row_sum, height, 5);
-  row_smooth = smooth(row_smooth, height, 7);
-  row_smooth = smooth(row_smooth, height, 15);
-
-
-  std::vector<float> localMax;
-  for (int i = 0; i < height; i++){
-    if(i != 0 && i != height-1){
-      if(row_smooth[i-1] < row_smooth[i] && row_smooth[i] > row_smooth[i+1]) {
-        localMax.push_back(row_smooth[i]);
-      }
-    }
-  }
-  sort(localMax.begin(), localMax.end(), std::greater<float>());
-
-  int wallUp, wallDown, axis;
-// 如果local maximum的數量>=3，就取出值前三大的local maximum，假設為血管壁位置
-  if (localMax.size()>=3) {
-      float max1 = localMax[0];
-      float max2 = localMax[1];
-      float max3 = localMax[2];
-      int wall1, wall2, wall3;
-    for(int i = 0; i < height; i++) {
-      if (row_smooth[i] == max1) wall1 = i;
-      else if(row_smooth[i] == max2) wall2 = i;
-      else if(row_smooth[i] == max3) wall3 = i;
-    }
-  // 上下血管壁位置取中間即為血管軸
-  // 算出三組可能為血管軸的位置，找出intensity value最小者
-  // 並記錄下此狀況下，血管壁的位置
-    int axis1 = (wall1 + wall2)/2;
-    int axis2 = (wall2 + wall3)/2;
-    int axis3 = (wall1 + wall3)/2;
-    axis = axis1;
-    wallUp = wall1;
-    wallDown = wall2;
-    if (row_smooth[axis] > row_smooth[axis2]) {
-      axis = axis2;
-      wallUp = wall2;
-      wallDown = wall3;
-    }
-    if (row_smooth[axis] > row_smooth[axis3]) {
-      axis = axis3;
-      wallUp = wall1;
-      wallDown = wall3;
-    }
-  }
-
-// 如果local maximum的數量>=2，兩血管壁位置取中間即為血管軸
-  else if(localMax.size()==2) {
-        float max1 = localMax[0];
-        float max2 = localMax[1];
-    int wall1, wall2;
-    for(int i = 0; i < height; i++) {
-      if (row_smooth[i] == max1) wall1 = i;
-      else if (row_smooth[i] == max2) wall2 = i;
-    }
-    axis = (wall1 + wall2)/2;
-    wallUp = wall1;
-    wallDown = wall2;
-  }
-
-  else {
-    // 無意義，確保萬一到error的時候不會掛掉
-    std::cout << "error";
-    result[0] = 0;
-    result[1] = 1;
-    result[2] = 2;
-    return result;
-  }
-
-  if (wallUp>wallDown) {
-      int temp = wallDown;
-      wallDown = wallUp;
-      wallUp = temp;
-  }
-
-// 透過血管壁與軸的位置做裁切，裁切邊界必須在img內
-  int cropLineUp = wallUp-(axis-wallUp);
-  if (cropLineUp<0) cropLineUp = 0;
-  int cropLineDown = wallDown+(wallDown-axis);
-  if (cropLineDown>height) cropLineDown = height;
-
-//  回傳裁切軸
-  result[0] = cropLineUp;
-  result[1] = axis;
-  result[2] = cropLineDown;
-  return result;
-}
-
-int ** SuperResolution::pasteBack(int** top, int** bot, int cropUp, int axis, int cropDown, int oriHeight, int oriWidth){
-    int ** paste = new int *[oriHeight];
-    for (int h = 0; h < oriHeight; h++){
-        paste[h] = new int [oriWidth];
-        // black area
-        if(h < cropUp || h >= cropDown){
-            for (int w = 0; w < oriWidth; w++){
-                paste[h][w] = 0;
-            }
-        }
-        // top
-        else if(h < axis){
-            for (int w = 0; w < oriWidth; w++){
-                paste[h][w] = top[h-cropUp][w];
-            }
-        }
-        // bot
-        else{
-            for (int w = 0; w < oriWidth; w++){
-                paste[h][w] = bot[h-axis][w];
-            }
-        }
-    }
-    return paste;
-
-}
-
-cv::Mat SuperResolution::eliNoise(cv::Mat src, int dark, int percentage){
-    std::vector<int> notDark;
-    for (int h = 0; h < src.rows; h++){
-        for (int w = 0; w < src.cols; w++){
-            if(src.at<uchar>(h,w) > dark){
-                notDark.push_back(src.at<uchar>(h,w));
-            }
-        }
-    }
-    sort(notDark.begin(), notDark.end());
-    int threshold = notDark[std::round(notDark.size()*percentage/100)];
-
-//    multiply = 255/(255-minus)
-//    img = np.where(img >= minus, (img-minus)*multiply, 0)
-    float multiply = 255/(255-threshold);
-    for (int h = 0; h < src.rows; h++){
-        for (int w = 0; w < src.cols; w++){
-            if(src.at<uchar>(h,w) >= threshold){
-                src.at<uchar>(h,w) = std::round((src.at<uchar>(h,w)-threshold)*multiply);
-            }
-            else{
-                src.at<uchar>(h,w) = 0;
-            }
-        }
-    }
-    return src;
-}
-cv::Mat SuperResolution::imgsToPrewitt(cv::Mat srcImage){
-    srcImage.convertTo(srcImage, CV_64F);
-
-    int ddepth = -1;
-    cv::Point anchor = cv::Point(-1, -1);
-    cv::Mat Prewitt, grad_x, grad_y;
-    cv::Mat kernelx = (cv::Mat_<double>(3,3) << -1., -1., -1., 0., 0., 0., 1., 1., 1.);
-    cv::Mat kernely = (cv::Mat_<double>(3,3) << -1, 0, 1, -1, 0, 1, -1, 0, 1);
-
-    // OpenCV convolution
-    cv::filter2D(srcImage, grad_x, ddepth, kernelx, anchor, cv::BORDER_CONSTANT);
-    cv::filter2D(srcImage, grad_y, ddepth, kernely, anchor, cv::BORDER_CONSTANT);
-
-    grad_x.convertTo(grad_x, CV_8UC1);
-    grad_y.convertTo(grad_y, CV_8UC1);
-    for(size_t i = 0; i < grad_y.rows; ++i) {
-        for(size_t j = 0; j < grad_y.cols; ++j) {
-            grad_y.at<uchar>(i, j) =255-( grad_y.at<uchar>(i, j) - grad_x.at<uchar>(i, j));
-        }
-    }
-
-    return grad_y;
-}
-//前處理區塊結束
-
-// resize到模型輸入大小，丟入模型，取出模型輸出，根據閾值轉成binary image return 
+// ==================== 模型 ====================
+/**
+ * 執行 TFLite 分割模型，輸出 224×224 的二值 mask。
+ * 輸入影像縮放到 224×224、正規化為 (x / 127.5 − 1)，依模型輸入通道數填成 1 或 3 通道；
+ * 輸出取第一通道，val × 255 > 128 者設為 255，其餘為 0。
+ * @param src          單通道灰階影像（不是 224×224 會自動 resize）
+ * @param out          已配置好的 int[224][224] 輸出陣列
+ * @param interpreter_ 要使用的 TFLite interpreter
+ * @param istop        true 時先將影像上下翻轉
+ * @return 成功 0；tensor 取得 / 複製 / 推論失敗或通道數不支援時 -1
+ */
 int SuperResolution::doseg(cv::Mat src, int** out,TfLiteInterpreter* interpreter_ , bool istop){
-    if(istop){
-        cv::flip(src, src, 0);//0 是上下翻轉
+    LOGD("=== doseg START ===");
+
+    if (istop) {
+        cv::flip(src, src, 0);
+        LOGD("Applied flip");
     }
-//    cv::Mat bilateral_img = src.clone();
-//    bilateralFilter(src, bilateral_img, 9, 50, 50);
-    cv::Mat sobel_img = src.clone();
 
-  
-  cv::Sobel(src, sobel_img, CV_32F,0,1);
-  cv::resize(sobel_img, sobel_img,cv::Size(512,128), 0, 0, cv::INTER_AREA);
 
-  cv::Mat prewitt_img = imgsToPrewitt(src);
-  prewitt_img.convertTo(prewitt_img, CV_32F);
-  cv::resize(prewitt_img, prewitt_img,cv::Size(512,128), 0, 0, cv::INTER_AREA);//prewitt
-
-  TfLiteTensor* input_tensor =
-          TfLiteInterpreterGetInputTensor(interpreter_, 0);
-
-  // Extract RGB values from each pixel
-  float input_buffer[modelinputHeight* modelinputWidth* modelinputChannels];
-  
-  for (int i = 0, k = 0; i < 128; i++) {
-    for(int j = 0; j < 512; j++){
-      input_buffer[k++] = static_cast<float>(sobel_img.at<float>(i,j)/255);
-      input_buffer[k++] = static_cast<float>(prewitt_img.at<float>(i,j)/255);
+    cv::Mat input_img;
+    if (src.rows != 224 || src.cols != 224) {
+        cv::resize(src, input_img, cv::Size(224, 224));
+        LOGD("Resized input to 224x224");
+    } else {
+        input_img = src;
+        LOGD("Input already 224x224");
     }
-  }
-  // Feed input into model
+
+    // 檢查輸入的統計值
+    cv::Scalar mean_src, stddev_src;
+    cv::meanStdDev(input_img, mean_src, stddev_src);
+    LOGD("doseg input - mean: %.2f, std: %.2f", mean_src[0], stddev_src[0]);
+
+    // 獲取輸入 tensor
+    TfLiteTensor* input_tensor = TfLiteInterpreterGetInputTensor(interpreter_, 0);
+    if (input_tensor == nullptr) {
+        LOGE("Input tensor is null!");
+        return -1;
+    }
+
+    // 獲取輸入維度
+    int input_dims_num = TfLiteTensorNumDims(input_tensor);
+    LOGD("Input tensor dimensions count: %d", input_dims_num);
+
+    if (input_dims_num >= 4) {
+        int batch = TfLiteTensorDim(input_tensor, 0);
+        int height = TfLiteTensorDim(input_tensor, 1);
+        int width = TfLiteTensorDim(input_tensor, 2);
+        int channels = TfLiteTensorDim(input_tensor, 3);
+        LOGD("Model input dims: batch=%d, height=%d, width=%d, channels=%d",
+             batch, height, width, channels);
+    }
+
+    // 獲取輸入類型
+    TfLiteType input_type = TfLiteTensorType(input_tensor);
+    LOGD("Input tensor type: %d (kTfLiteFloat32 = 1)", input_type);
+
+    // 決定模型輸入尺寸
+    int modelHeight = 224;
+    int modelWidth = 224;
+    int modelChannels = 3;
+
+    // 從 tensor 獲取實際尺寸
+    if (input_dims_num >= 4) {
+        modelHeight = TfLiteTensorDim(input_tensor, 1);
+        modelWidth = TfLiteTensorDim(input_tensor, 2);
+        modelChannels = TfLiteTensorDim(input_tensor, 3);
+        LOGD("Using actual model input dims: %dx%dx%d", modelHeight, modelWidth, modelChannels);
+    }
+
+
+    int bufferSize = modelHeight * modelWidth * modelChannels;
+    float* input_buffer = new float[bufferSize];
+
+    // 根據輸入通道數填充數據
+    if (modelChannels == 1) {
+        // 單通道 (灰階)
+        for (int i = 0; i < modelHeight; i++) {
+            for (int j = 0; j < modelWidth; j++) {
+                input_buffer[i * modelWidth + j] = input_img.at<uchar>(i, j) / 127.5f - 1.0f;
+            }
+        }
+    } else if (modelChannels == 3) {
+        // 三通道 (RGB) - 將灰階轉成 RGB
+        for (int i = 0; i < modelHeight; i++) {
+            for (int j = 0; j < modelWidth; j++) {
+                float val = input_img.at<uchar>(i, j) / 127.5f - 1.0f;
+                int idx = (i * modelWidth + j) * 3;
+                input_buffer[idx] = val;     // R
+                input_buffer[idx + 1] = val; // G
+                input_buffer[idx + 2] = val; // B
+            }
+        }
+    } else {
+        LOGE("Unsupported input channels: %d", modelChannels);
+        delete[] input_buffer;
+        return -1;
+    }
+
+    LOGD("input_buffer[0]: %f", input_buffer[0]);
+
+    // 給模型
     TfLiteStatus status = TfLiteTensorCopyFromBuffer(
-          input_tensor, input_buffer,
-          modelinputHeight* modelinputWidth* modelinputChannels* sizeof(float));
-  if (status != kTfLiteOk) {
-    LOGE("Something went wrong when copying input buffer to input tensor");
-    return -1;
-  }
-  // Run the interpreter
-  status = TfLiteInterpreterInvoke(interpreter_);
-  if (status != kTfLiteOk) {
-    LOGE("Something went wrong when running the TFLite model");
-    return -1;
-  }
-
-  // Extract the output tensor data
-  const TfLiteTensor* output_tensor =
-          TfLiteInterpreterGetOutputTensor(interpreter_, 0);
-    float output_buffer[modeloutputHeight* modeloutputWidth* modeloutputChannel];
-  status = TfLiteTensorCopyToBuffer(
-          output_tensor, output_buffer,
-          modeloutputHeight* modeloutputWidth* modeloutputChannel * sizeof(float));
-  if (status != kTfLiteOk) {
-    LOGE("Something went wrong when copying output tensor to output buffer");
-    return -1;
-  }
-  for(int i = 0, k= 0; i< 128; i++){
-    for(int j = 0; j<  512; j++){
-      out[i][j] = (output_buffer[k++]*255 > outputthreshold)? 255:0; 
+            input_tensor, input_buffer,
+            bufferSize * sizeof(float));
+    if (status != kTfLiteOk) {
+        LOGE("Failed to copy input buffer to input tensor");
+        delete[] input_buffer;
+        return -1;
     }
-  }
-  return 0;
+    LOGD("Input copied successfully");
 
+    // 執行模型
+    status = TfLiteInterpreterInvoke(interpreter_);
+    if (status != kTfLiteOk) {
+        LOGE("Failed to run TFLite model, status: %d", status);
+        delete[] input_buffer;
+        return -1;
+    }
+    LOGD("Model invoked successfully");
+
+    // 獲取輸出 tensor
+    const TfLiteTensor* output_tensor = TfLiteInterpreterGetOutputTensor(interpreter_, 0);
+    if (output_tensor == nullptr) {
+        LOGE("Output tensor is null!");
+        delete[] input_buffer;
+        return -1;
+    }
+
+    // 獲取輸出維度
+    int output_dims_num = TfLiteTensorNumDims(output_tensor);
+    LOGD("Output tensor dimensions count: %d", output_dims_num);
+
+    TfLiteQuantizationParams output_quant = TfLiteTensorQuantizationParams(output_tensor);
+    LOGD("Output quantization: scale=%f, zero_point=%d", output_quant.scale, output_quant.zero_point);
+
+    // 檢查輸出類型
+    TfLiteType output_type = TfLiteTensorType(output_tensor);
+    LOGD("Output tensor type: %d (1=float32, 3=int8, 9=uint8)", output_type);
+
+    int outputHeight = 224;
+    int outputWidth = 224;
+    int outputChannels = 1;
+
+    if (output_dims_num >= 4) {
+        outputHeight = TfLiteTensorDim(output_tensor, 1);
+        outputWidth = TfLiteTensorDim(output_tensor, 2);
+        outputChannels = TfLiteTensorDim(output_tensor, 3);
+        LOGD("Model output dims: height=%d, width=%d, channels=%d",
+             outputHeight, outputWidth, outputChannels);
+    }
+
+    int outputSize = outputHeight * outputWidth * outputChannels;
+    float* output_buffer = new float[outputSize];
+
+    status = TfLiteTensorCopyToBuffer(
+            output_tensor, output_buffer,
+            outputSize * sizeof(float));
+    if (status != kTfLiteOk) {
+        LOGE("Failed to copy output tensor to output buffer");
+        delete[] input_buffer;
+        delete[] output_buffer;
+        return -1;
+    }
+    LOGD("Output copied successfully");
+
+    // 檢查輸出
+    float sum = 0;
+    for (int i = 0; i < outputSize; i++) {
+        sum += output_buffer[i];
+    }
+    LOGD("Output buffer mean: %.6f", sum / outputSize);
+    LOGD("Output buffer[0]: %f", output_buffer[0]);
+
+    // 轉換輸出為 mask (只取第一個通道)
+    int threshold = 128;
+    for (int i = 0; i < outputHeight; i++) {
+        for (int j = 0; j < outputWidth; j++) {
+            int idx = (i * outputWidth + j) * outputChannels;
+            float val = output_buffer[idx];  // 取第一個通道
+            out[i][j] = (val * 255 > threshold) ? 255 : 0;
+        }
+    }
+
+    int nonZeroCount = 0;
+    for (int i = 0; i < outputHeight; i++) {
+        for (int j = 0; j < outputWidth; j++) {
+            if (out[i][j] > 0) nonZeroCount++;
+        }
+    }
+    LOGD("Mask non-zero pixels: %d / %d", nonZeroCount, outputHeight * outputWidth);
+
+    delete[] input_buffer;
+    delete[] output_buffer;
+
+    LOGD("=== doseg END ===");
+    return 0;
 }
 
-cv::Mat SuperResolution::postprocess(cv::Mat src, cv::Mat osrc,int croplinemid , int croplineup)
-{
-    //cvtColor(src, src, cv::COLOR_RGB2GRAY);
-    cv::cvtColor(osrc, osrc,cv::COLOR_GRAY2BGR);
-    cv::Mat thresh;
-    const int img_width = inputWidth;//src.cols;
-    const int img_height = inputHeight;//src.rows;
-    const int oimg_width = inputWidth;//osrc.cols;
-    const int oimg_height = inputHeight;//osrc.rows;
-    int flex = 10;
-    int th = outputthreshold;
-    float average_imt = 0;
-    int count = 0;
-    cv::threshold(src, thresh, th, 255, cv::THRESH_BINARY);
-    std::vector<std::vector<cv::Point>> contours;
-    std::vector<cv::Vec4i> hierarchy;
-    cv::findContours(thresh, contours,hierarchy,cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE); // Find the contours in the image
-    cv::Mat Contours = cv::Mat::zeros(src.size(),CV_8UC3);
-    int roi[50]={},rect2[50][4]={},imt[50]={},upper_index[50]={},bottom_index[50]={};
-    int bound[4]={0,img_height,0,0};
-    std::vector<cv::Rect> boundRect(1);
-    for(int i = 0; i < contours.size();++i){
-        if(contourArea(contours[i]) > 150){
-            boundRect[0] = boundingRect(contours[i]);
-            if (boundRect[0].y < croplinemid &&  boundRect[1].y > bound[0]){
-                bound[0] = boundRect[0].y;
-                bound[2] = boundRect[0].y+boundRect[0].height;
-            }else if (boundRect[0].y + boundRect[0].height > croplinemid && boundRect[0].y+boundRect[0].height < bound[1]){
-                bound[1] = boundRect[0].y;
-                bound[3] = boundRect[0].y+boundRect[0].height;
-            }
-        }
-    }
-    for(int i = 0; i < contours.size();++i){
-        if(contourArea(contours[i]) > 150){
-            boundRect[0] = boundingRect(contours[i]);
-            if (boundRect[0].y < croplinemid && (boundRect[0].y > bound[0] - flex)||(boundRect[0].y+boundRect[0].height > bound[0]-5) && (boundRect[0].y < bound[2])){
-                drawContours(Contours, contours, i, cv::Scalar(0,0,255), 2);
-                roi[i] = 1;
-                upper_index[i]=1;
-            }else if(boundRect[0].y + boundRect[0].height > croplinemid && (boundRect[0].y+boundRect[0].height < bound[3] + flex)or(boundRect[0].y<bound[3]+5) && (boundRect[0].y+boundRect[0].height > bound[1])){
-                drawContours(Contours, contours, i, cv::Scalar(0,0,255), 2);
-                roi[i] = 1;
-                bottom_index[i]=1;
-            }
-        }
-    }
-    for(int i = 0;i < contours.size();++i){
-        if(roi[i] == 1){
-            boundRect[0] = boundingRect(contours[i]);
-            rect2[i][0] = boundRect[0].x;
-            rect2[i][1] = boundRect[0].y;
-            rect2[i][2] = boundRect[0].width;
-            rect2[i][3] = boundRect[0].height;
-            imt[i] = boundRect[0].y + boundRect[0].height;
-        }
-    }
-    for(int i = 0;i < contours.size();++i){
-        if(roi[i] == 1){
-            if(imt[i] > croplinemid){
-                average_imt += contourArea(contours[i]);
-                count += rect2[i][2];
-            }
-        }
-    }
-    average_imt /= count;
+/**
+ * 後處理：由分割 mask 與取樣線求出中心線、交點、切線方向、Range Gate 邊界與角度。
+ * 1. 把 224×224 mask 放大 / 裁切回 image_w×image_h，並產生中心線 mask。
+ * 2. 若外部取樣線 (p_top→p_bottom) 與中心線有交點：以第一個交點為 center。
+ *    否則（備援）：取中心線中位點為 center，改以 kFallbackBeamAngleDeg 通過 center 重畫線束。
+ * 3. 在 center 以 PCA 取切線 direction；沿線束往上下找血管 mask 邊界（find_RangeGate）。
+ * 4. 計算絕對角（切線 vs 垂直軸）與相對角（切線 vs 線束），並沿法向掃描管徑。
+ * @param mask     模型輸出 mask（224×224，CV_8UC1）
+ * @param img_ori  前處理後的 224×224 灰階影像（只用來決定尺寸）
+ * @param p_top    取樣線頂端點（原圖座標）
+ * @param p_bottom 取樣線底端點（原圖座標）
+ * @param image_h  原圖高
+ * @param image_w  原圖寬
+ * @return PostProcessResult；中心線為空、取樣線為 (0,0)-(0,0) 或中心線點數 < 20 時 success=false
+ */
+PostProcessResult SuperResolution::postprocess(const cv::Mat& mask, const cv::Mat& img_ori, cv::Point p_top, cv::Point p_bottom, int image_h, int image_w) {
+    PostProcessResult result;
+    result.success = false;
 
-    float average_up_imt = 0;
-    int count2 = 0;
-    for(int i = 0;i < contours.size();++i){
-        if(roi[i] == 1){
-            if(imt[i] < croplinemid){
-                average_up_imt += contourArea(contours[i]);
-                count2 += rect2[i][2];
-            }
-        }
-    }
-    average_up_imt /= count2;
-    float c[img_width][4] = {};
-    float averageRatio = 0,medianRatio = 0,minRatio = 1;
-    float Ratio[img_width]={};
-    float median_Ratio[img_width]={};
-    int len_upper = 0, len_bottom = 0;
-    for(int i = 0; i < contours.size(); ++i){
-            if(upper_index[i] == 1) {
-                len_upper += 1;
-            }
-            if(bottom_index[i] == 1){
-                len_bottom += 1;
-            }
-    }
-    if(len_upper < 1){
-        std::cout << "No upper boundary was labeled!\n";    //上部沒有標記到，則不算Ratio，只算IMT，Ratio在後面也不會print出來
-    }
-    else{
-        for(int u = 0; u < contours.size();++u){
-            if(upper_index[u] == 1){
-                boundRect[0] = boundingRect(contours[u]);
-                int temp = boundRect[0].y+boundRect[0].height;
-                for(int j = boundRect[0].x; j < boundRect[0].x +boundRect[0].width; ++j){
-                    for(int i = boundRect[0].y; i < boundRect[0].y +boundRect[0].height; ++i){
-                        if(thresh.at<uchar>(i,j)<thresh.at<uchar>(i+1,j)){
-                            c[j][0] = i;
-                            break;
-                        }
-                    }
-                    for (int i = 0; i < boundRect[0].height; ++i){
-                        if(thresh.at<uchar>(temp - i,j)<thresh.at<uchar>(temp-1-i,j)){
-                            c[j][1] = temp - i;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        for(int u = 0; u < contours.size();++u){
-            if(bottom_index[u] == 1){
-                boundRect[0] = boundingRect(contours[u]);
-                int temp = boundRect[0].y+boundRect[0].height;
-                for(int j = boundRect[0].x; j < boundRect[0].x +boundRect[0].width; ++j){
-                    for(int i = boundRect[0].y; i < boundRect[0].y +boundRect[0].height; ++i){
-                        if(thresh.at<uchar>(i,j)<thresh.at<uchar>(i+1,j)){
-                            c[j][2] = i;
-                            break;
-                        }
-                    }
-                    for (int i = 0; i < boundRect[0].height; ++i){
-                        if(thresh.at<uchar>(temp - i,j)<thresh.at<uchar>(temp-1-i,j)){
-                            c[j][3] = temp - i;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        count = 0;
-        for(int i = 0; i < img_width;++i){
-            if(c[i][0]>0 && c[i][1]>0 && c[i][2]>0 && c[i][3]>0){
-                Ratio[i] = (c[i][2] - c[i][1])/(c[i][3] - c[i][0]);
-            }
-        }
-        //sum ratio
-        float sumRatio = 0;
-        int count_median = 0;
-        for(int i = 0; i < img_width;++i){
-            if(Ratio[i] > 0){
-                median_Ratio[count_median++] = Ratio[i];
-                sumRatio += Ratio[i];
-            }
-        }
-        //len ratio
-        float lenRatio = 0;
-        int count = 0;
-        for(int i = 0; i < img_width;++i){
-            if(Ratio[i] > 0){
-                lenRatio += 1;
-            }
-        }
-        averageRatio = sumRatio/lenRatio;
-        //median Ratio
-        float temp;
-        for(int i=0;i<count_median-1;++i) {
-            for(int j=0;j<count_median-i-1;++j) {
-                if(median_Ratio[j]>median_Ratio[j+1]){
-                    temp = median_Ratio[j];
-                    median_Ratio[j] = median_Ratio[j+1];
-                    median_Ratio[j+1] = temp;
-                }
-            }
-            medianRatio = median_Ratio[count_median/2];
-        }
+    cv::Mat img = img_ori.clone();
+    cv::Mat image = mask.clone();
 
-        //minRatio
-        for(int i = 0; i < img_width;++i){
-            if(Ratio[i] > 0){
-                if(Ratio[i] < minRatio){
-                    minRatio = Ratio[i];
-                }
-            }
-        }
+    // ====== 224 -> target size ======
+    if (image_h > image_w) {
+        img = resize_img(img, image_h);
+        image = resize_img(mask, image_h);
+        LOGD("Resize mask size: %dx%d (WxH)", image.cols, image.rows);
+        int width_pad = (image_h - image_w) / 2;
+        image = crop_img(image, width_pad, width_pad + image_w, 0, image_h);
+    } else {
+        img = resize_img(img, image_w);
+        image = resize_img(mask, image_w);
+        LOGD("Resize mask size: %dx%d (WxH)", image.cols, image.rows);
+        int width_pad = (image_w - image_h) / 2;
+        image = crop_img(image, 0, image_w, width_pad, width_pad + image_h);
     }
-    cv::Mat image_cropped = cv::Mat::zeros(osrc.size(),CV_8UC3);
-    cv::addWeighted(osrc,0.8,Contours,1.0,0,image_cropped);  //add weught of oringinal image and contours
-
-    /*----------------------------------
-                Print part
-    Show (括號後面為變數名稱)
-    1. IMT (float averageIMT，若只標記到上半部則是用float average_up_imt)
-    2. average of LD/IAD (float averageRatio)
-    3. min of LD/IAD (float minRatio)
-    4. median of LD/IAD (float medianRatio)
-    這4個變數是我們希望最後可以秀出來的數字
 
 
+    // ====== Generate centerline ======
+    cv::Mat centerLine = process_single_centerline(img, mask);
 
+    // Crop to final size
+    if (image_h > image_w) {
+        int width_pad = (image_h - image_w) / 2;
+        img = crop_img(img, width_pad, width_pad + image_w, 0, image_h);
+        centerLine = crop_img(centerLine, width_pad, width_pad + image_w, 0, image_h);
+    } else {
+        int width_pad = (image_w - image_h) / 2;
+        img = crop_img(img, 0, image_w, width_pad, width_pad + image_h);
+        centerLine = crop_img(centerLine, 0, image_w, width_pad, width_pad + image_h);
+    }
 
+    LOGD("CenterLine mask size: %dx%d (WxH)", centerLine.cols, centerLine.rows);
 
-    /*********************************
-            將文字秀在圖片上
-        output image(Mat text_image)
-    *********************************/
-    cv::Mat text_image = image_cropped.clone();
-    if(len_upper > 0 && len_bottom > 0){
-        std::string text("Average Ratio = "+std::to_string(averageRatio));
-        std::string text1("Min Ratio     = "+std::to_string(minRatio));
-        std::string text2("Median Ratio  = "+std::to_string(medianRatio));
-        std::string text3("Average IMT   = "+std::to_string(average_imt)+"(pixels)");
-        putText(text_image,text, cv::Point(0,img_height-55), cv::FONT_HERSHEY_SIMPLEX,0.4, cv::Scalar(0,255,255),1);
-        putText(text_image,text1,cv::Point(0,img_height-40),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        putText(text_image,text2,cv::Point(0,img_height-25),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        putText(text_image,text3,cv::Point(0,img_height-10),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-    }else{   //上部or下部沒標記到IMT正常印其它NaN
-        std::string text("Average Ratio = NAN");
-        std::string text1("Min Ratio     = NaN");
-        std::string text2("Median Ratio  = NaN");
-        std::string text3("Average IMT   = "+std::to_string(average_imt)+"(pixels)");
-        std::string text4("Average IMT   = "+std::to_string(average_up_imt)+"(pixels)");
-        std::string text5("Average IMT   = NaN");
-        putText(text_image,text,cv::Point(0,img_height-55),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        putText(text_image,text1,cv::Point(0,img_height-40),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        putText(text_image,text2,cv::Point(0,img_height-25),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        if(len_upper < 1 && len_bottom > 0){
-            putText(text_image,text3,cv::Point(0,img_height-10),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        }else if(len_bottom < 1 && len_upper > 0){
-            putText(text_image,text4,cv::Point(0,img_height-10),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
-        }else{
-            putText(text_image,text5,cv::Point(0,img_height-10),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,255,255),1);
+    if (cv::countNonZero(centerLine) == 0) {
+        LOGD("Warning: skeleton is empty");
+        return result;
+    }
+
+    if (p_top == cv::Point(0, 0) && p_bottom == cv::Point(0, 0)) {
+        LOGD("Failed to detect line segment");
+        return result;
+    }
+
+    // ====== Draw line beam ======
+    cv::Mat lines = cv::Mat::zeros(image.rows, image.cols, CV_8UC1);
+    cv::line(lines, p_top, p_bottom, 255, 1);
+
+    // ====== Find intersection ======
+    cv::Mat intersection_mask;
+    cv::bitwise_and(lines, centerLine, intersection_mask);
+    std::vector<cv::Point> intersection_pts;
+    cv::findNonZero(intersection_mask, intersection_pts);
+
+    cv::Point center;
+    cv::Point2f direction(1.0f, 0.0f);
+    cv::Point in_top, in_bottom;
+    cv::Point intersection_top, intersection_bottom;
+
+    LOGD("find %d intersection_pts.", intersection_pts.size());
+    if (!intersection_pts.empty()) {
+        center = intersection_pts[0];
+
+        cv::Mat mask_and;
+        cv::bitwise_and(lines, image, mask_and);
+        std::vector<cv::Point> green_points;
+        cv::findNonZero(mask_and, green_points);
+
+        if (!green_points.empty()) {
+            direction = get_tangent_direction(centerLine, center, 15);
+
+            in_top = *std::min_element(green_points.begin(), green_points.end(),
+                                       [](const cv::Point& a, const cv::Point& b) { return a.y < b.y; });
+            in_bottom = *std::max_element(green_points.begin(), green_points.end(),
+                                          [](const cv::Point& a, const cv::Point& b) { return a.y < b.y; });
+             intersection_top = find_RangeGate(center, in_top, image);
+             intersection_bottom = find_RangeGate(center, in_bottom, image);
+        }
+    } else {
+        // Find center of centerline
+        std::vector<cv::Point> cl_points;
+        cv::findNonZero(centerLine, cl_points);
+
+        if (static_cast<int>(cl_points.size()) < 20) {
+            LOGD("Not enough centerline points");
+            return result;
+        }
+
+        std::vector<int> xs, ys;
+        for (const auto& pt : cl_points) {
+            xs.push_back(pt.x);
+            ys.push_back(pt.y);
+        }
+        std::sort(xs.begin(), xs.end());
+        std::sort(ys.begin(), ys.end());
+
+        int median_x = xs[xs.size() / 2];
+        int median_y = ys[ys.size() / 2];
+
+        int best_idx = 0;
+        long long best_dist = std::numeric_limits<long long>::max();
+        for (size_t j = 0; j < cl_points.size(); j++) {
+            long long d = static_cast<long long>(cl_points[j].x - median_x) *
+                    (cl_points[j].x - median_x) +
+                    static_cast<long long>(cl_points[j].y - median_y) *
+                    (cl_points[j].y - median_y);
+            if (d < best_dist) {
+                best_dist = d;
+                best_idx = static_cast<int>(j);
+            }
+        }
+        center = cl_points[best_idx];
+
+        direction = get_tangent_direction(centerLine, center, 15);
+
+        auto [p_t, p_b] = get_boundary_intersection_direct(
+                image.size(), center, kFallbackBeamAngleDeg);
+        p_top = p_t;
+        p_bottom = p_b;
+
+        lines = cv::Mat::zeros(image.rows, image.cols, CV_8UC1);
+        cv::line(lines, p_top, p_bottom, 255, 1);
+
+        cv::Mat mask_and;
+        cv::bitwise_and(lines, image, mask_and);
+        std::vector<cv::Point> green_points;
+        cv::findNonZero(mask_and, green_points);
+
+        if (!green_points.empty()) {
+            in_top = *std::min_element(green_points.begin(), green_points.end(),
+                                       [](const cv::Point& a, const cv::Point& b) { return a.y < b.y; });
+            in_bottom = *std::max_element(green_points.begin(), green_points.end(),
+                                          [](const cv::Point& a, const cv::Point& b) { return a.y < b.y; });
+
+            intersection_top = find_RangeGate(center, in_top, image);
+            intersection_bottom = find_RangeGate(center, in_bottom, image);
         }
     }
 
-    /*----------------------------------
-            OpenCV Show image part
-    output image type of image_cropped => Mat
-    將數據加在image_cropped上的圖 (Mat image_cropped)
-    若沒有要印出來則下兩行可以刪掉
-    ------------------------------------*/
+    // 計算角度
+    double angle_abs = calculate_angle_between_vectors(cv::Point(0, 0), cv::Point(0, 1), direction, true);
+    double angle_relative = 0.0;
+    if (intersection_top != cv::Point(0, 0) && intersection_bottom != cv::Point(0, 0)) {
+        angle_relative = calculate_angle_between_vectors(intersection_bottom, intersection_top, direction, true);
+    }
+
+    // 計算管徑：從 center 沿血管法向往兩側掃描 mask 邊界
+    cv::Point2f perp(-direction.y, direction.x);
+    auto walk_to_edge = [&](cv::Point2f dir) -> int {
+        int last_inside = 0;
+        const int max_search = 100;
+        for (int d = 1; d < max_search; d++) {
+            int x = static_cast<int>(std::round(center.x + dir.x * d));
+            int y = static_cast<int>(std::round(center.y + dir.y * d));
+            if (x < 0 || x >= image.cols || y < 0 || y >= image.rows) break;
+            if (image.at<uchar>(y, x) == 0) break;
+            last_inside = d;
+        }
+        return last_inside;
+    };
+
+    double vessel_width = 0.0;
+    cv::Point diameter_top = center;
+    cv::Point diameter_bottom = center;
+    if (center.x >= 0 && center.x < image.cols &&
+        center.y >= 0 && center.y < image.rows &&
+        image.at<uchar>(center.y, center.x) != 0) {
+        int r1 = walk_to_edge(perp);
+        int r2 = walk_to_edge(cv::Point2f(-perp.x, -perp.y));
+        vessel_width = static_cast<double>(r1 + r2);
+        diameter_top = cv::Point(
+                static_cast<int>(std::round(center.x - perp.x * r2)),
+                static_cast<int>(std::round(center.y - perp.y * r2)));
+        diameter_bottom = cv::Point(
+                static_cast<int>(std::round(center.x + perp.x * r1)),
+                static_cast<int>(std::round(center.y + perp.y * r1)));
+    }
 
 
-    /*
-        要附有文字的圖片的話用 text_image這張圖
-        反之則是使用 image_cropped
-    */
-    //cvtColor(text_image, text_image, cv::COLOR_RGB2GRAY);
-    return text_image;
+// 填充結果
+    result.success = true;
+    result.angle_abs = angle_abs;
+    result.angle_relative = angle_relative;
+    result.center = center;
+    result.intersection_top = intersection_top;
+    result.intersection_bottom = intersection_bottom;
+    result.p_top = p_top;
+    result.p_bottom = p_bottom;
+    result.direction = direction;
+    result.vessel_diameter = vessel_width;
+    result.diameter_top = diameter_top;
+    result.diameter_bottom = diameter_bottom;
+    result.perp_direction = perp;
+    return result;
 }
 
-//主函式
-std::unique_ptr<int[]> SuperResolution::DoSuperResolution(int* lr_img_rgb) {
-  // Allocate tensors and populate the input tensor data
-//  TfLiteStatus status = TfLiteInterpreterAllocateTensors(interpreter_);
-//  if (status != kTfLiteOk) {
-//    LOGE("Something went wrong when allocating tensors");
-//    return nullptr;
-//  }
-//
-//  TfLiteTensor* input_tensor =
-//      TfLiteInterpreterGetInputTensor(interpreter_, 0);
+/**
+ * 把後處理結果疊畫到原圖：綠色線束（畫到管徑 kRangeGateRatio 處）、紅色切線、
+ * 紅色垂直短線標示 Range Gate 上下位置。
+ * @param img_ori 原圖（灰階或 BGR）
+ * @param result  postprocess() 的結果；success=false 時只回傳轉成 BGR 的原圖
+ * @return BGR 視覺化影像
+ */
+cv::Mat SuperResolution::visualizePostProcess(
+    const cv::Mat& img_ori,
+    const PostProcessResult& result) {
 
-//  // Extract RGB values from each pixel
-//  float input_buffer[kNumberOfInputPixels * kImageChannels];
-//  for (int i = 0, j = 0; i < kNumberOfInputPixels; i++) {
-//    // Alpha is ignored
-//    input_buffer[j++] = static_cast<float>((lr_img_rgb[i] >> 16) & 0xff);
-//    input_buffer[j++] = static_cast<float>((lr_img_rgb[i] >> 8) & 0xff);
-//    input_buffer[j++] = static_cast<float>((lr_img_rgb[i]) & 0xff);
-//  }
-
-/////////////////////////////////////////////////////////////////////
-
-// 因為原圖就是黑白的 所以24bit的最右邊8bit extract出來就可以
-  int  Gray_input_buffer[inputPixelNumber];
-  for (int i = 0; i < inputPixelNumber; i++) {
-      Gray_input_buffer[i] = (lr_img_rgb[i] >> 16) & 0xff;
-  }
-
-  // 轉成2D
-  int ** img_2D = oneDtotwoD(Gray_input_buffer, inputHeight, inputWidth);
-
-
-
-
-/////////////////////////////////////////////////////////////////////
-  int ** initCrop = InitCrop(img_2D, initCropX0, initCropX1, initCropY0, initCropY1);
-  int * cropAxis = get_cropImg_axis(initCrop, initCropHeight, initCropWidth);
-  int ** top = InitCrop(initCrop, 0, initCropX1 - initCropX0, cropAxis[0], cropAxis[1]);
-  int ** bot = InitCrop(initCrop, 0, initCropX1 - initCropX0, cropAxis[1], cropAxis[2]);
-
-  // 將 top bot做 eli noise(目前不含bilateral)
-
-
-  // 轉成mat做後續動作，再轉回int 2d array
-  cv::Mat top_mat = int2mat(top, cropAxis[1] - cropAxis[0], initCropWidth);
-  cv::Mat bot_mat = int2mat(bot, cropAxis[2] - cropAxis[1], initCropWidth);
-
-  cv::Mat top_bilateral = top_mat.clone(); //bilateral src和dst不能一樣
-  cv::Mat bot_bilateral = bot_mat.clone();
-  bilateralFilter(top_mat, top_bilateral, 9, 50, 50);
-  bilateralFilter(bot_mat, bot_bilateral, 9, 50, 50);
-
-  top_mat = eliNoise(top_bilateral, 20, 60);
-  bot_mat = eliNoise(bot_bilateral, 20, 15);
-  TfLiteStatus status = TfLiteInterpreterAllocateTensors(interpreter_);
-  if (status != kTfLiteOk) {
-    LOGE("Something went wrong when allocating tensors");
-    return nullptr;
-  }
-  
-  //input to model
-  //top image
-  int **top_out = new int*[modeloutputHeight];
-  for (int i = 0; i< modeloutputHeight; i++) {
-      top_out[i] = new int[modeloutputWidth];
+    // 準備結果圖像
+    cv::Mat result_img;
+    if (img_ori.channels() == 1) {
+        cv::cvtColor(img_ori, result_img, cv::COLOR_GRAY2BGR);
+    } else {
+        result_img = img_ori.clone();
     }
-  int seg_status = doseg(top_mat, top_out, interpreter_, 1);
-  if (seg_status == -1)
-      return nullptr;
-  //bottom image
-  int **bot_out = new int*[modeloutputHeight];
-  for (int i = 0; i< modeloutputHeight; i++) {
-      bot_out[i] = new int[modeloutputWidth];
-  }
-  seg_status = doseg(bot_mat, bot_out, interpreter_, 0);
-  if (seg_status == -1)
-      return nullptr;
 
-  //convert to mat to resize
-  cv::Mat top_out_mat = int2mat(top_out, modeloutputHeight, modeloutputWidth);
-  cv::flip(top_out_mat, top_out_mat, 0);
-  cv::resize(top_out_mat, top_out_mat,cv::Size(initCropX1 - initCropX0 , cropAxis[1] - cropAxis[0]), 0, 0, cv::INTER_NEAREST);
+    if (!result.success) {
+        return result_img;
+    }
 
+    // 計算管徑 2/3 位置 (往中心線靠近)
+    cv::Point range_top = result.center + (result.intersection_top - result.center) * kRangeGateRatio;
+    cv::Point range_bottom = result.center + (result.intersection_bottom - result.center) * kRangeGateRatio;
 
-  cv::Mat bot_out_mat = int2mat(bot_out, modeloutputHeight, modeloutputWidth);
-  cv::resize(bot_out_mat, bot_out_mat,cv::Size(initCropX1 - initCropX0 , cropAxis[2] - cropAxis[1]), 0, 0, cv::INTER_NEAREST);
+    // 繪製線束（綠色）：畫到管徑 2/3 處
+    cv::line(result_img, result.p_top, range_top, cv::Scalar(0, 255, 0), 1);
+    cv::line(result_img, range_bottom, result.p_bottom, cv::Scalar(0, 255, 0), 1);
 
+    // 繪製切線（紅色）
+    draw_tangent(result_img, result.center, result.direction, 30);
 
-  int **top_result = mat2int(top_out_mat);
-  int **bot_result = mat2int(bot_out_mat);
+    // 繪製 Range Gate（紅色垂直線）：標在管徑 2/3 處
+    if (result.intersection_top != cv::Point(0, 0) && result.intersection_bottom != cv::Point(0, 0)) {
+        draw_perpendicular_line(result_img, result.p_top, result.p_bottom,
+                                        range_top, 20, cv::Scalar(0, 0, 255), 2);
+        draw_perpendicular_line(result_img, result.p_top, result.p_bottom,
+                                        range_bottom, 20, cv::Scalar(0, 0, 255), 2);
+    }
 
-  // 貼回去最後的result
-  int ** paste = pasteBack(top_result, bot_result, cropAxis[0], cropAxis[1], cropAxis[2], initCropHeight, initCropWidth);
+    return result_img;
+}
 
-  //cv::Mat paste_mat = int2mat(paste, initCropHeight,  initCropWidth);
-    cv::Mat paste_mat = cv::Mat(inputHeight, inputWidth,CV_8UC1);
-    for(int i = 0; i< inputHeight; i++){
-        for(int j = 0; j< inputWidth; j++){
-            paste_mat.at<uchar>(i, j) = 0;
-        }
-    }//initialize
-    for(int i = 0; i< initCropHeight; i++){
-        for(int j = 0; j< initCropWidth; j++){
-            paste_mat.at<uchar>(i + initCropY0, j + initCropX0) = (uint8_t)paste[i][j];
+/**
+ * 整條 pipeline 的進入點（由 JNI superResolutionFromJNI 呼叫）：
+ * 1. ARGB → BGR Mat　2. 由 top_x / line_angle 算出取樣線端點　3. resize_with_padding 到 224
+ * 4. 轉灰階　5. CLAHE　6. doseg 模型推論　7. postprocess　8. mask 放大回原尺寸
+ * 9. visualizePostProcess 疊圖並轉回 ARGB。後處理結果同時存入 last_result_ 供 PW_* getter 讀取。
+ * @param lr_img_rgb inputWidth×inputHeight 的 ARGB 像素陣列（row-major）
+ * @param line_angle 取樣線角度（度，見 get_line_point 的定義）
+ * @param top_x      取樣線頂端 x 座標
+ * @return 同尺寸的 ARGB 視覺化影像；tensor 配置或推論失敗時回傳 nullptr
+ */
+std::unique_ptr<int[]> SuperResolution::DoSuperResolution(int* lr_img_rgb, double line_angle, int top_x) {
+
+    // ============= 前處理 =============
+    LOGD("=== DoSuperResolution START ===");
+    LOGD("Target size: %dx%d (WxH)", inputWidth, inputHeight);
+    std::vector<int> result_values;
+
+    // 1. ARGB → BGR
+    LOGD("Step 1: Converting to Mat...");
+    cv::Mat bgr_img(inputHeight, inputWidth, CV_8UC3);
+    for (int i = 0; i < inputHeight; i++) {
+        for (int j = 0; j < inputWidth; j++) {
+            int argb = lr_img_rgb[i * inputWidth + j];
+            uint8_t r = (argb >> 16) & 0xff;
+            uint8_t g = (argb >> 8) & 0xff;
+            uint8_t b = argb & 0xff;
+            bgr_img.at<cv::Vec3b>(i, j) = cv::Vec3b(b, g, r);
         }
     }
 
-  cv::Mat img2D_mat = int2mat(img_2D, inputHeight, inputWidth);//original image
-  cv::Mat result_mat = postprocess(paste_mat, img2D_mat, cropAxis[1] + initCropY0 , cropAxis[0] + initCropY0);
-  //  cv::Mat result_mat =  paste_mat;
-    //cv::addWeighted(result_mat,0.8,img2D_mat,1.0,0,result_mat);
-    int ***result2D = new int**[outputHeight];
-    for(int i = 0; i< outputHeight; i++){
-        result2D[i] = new int*[outputWidth];
-        for(int j = 0; j < outputWidth; j++){
-            result2D[i][j] = new int[outputChannel];
-            result2D[i][j][0] =  result_mat.at<cv::Vec3b>(i,j)[2];
-            result2D[i][j][1] =  result_mat.at<cv::Vec3b>(i,j)[1];
-            result2D[i][j][2] =  result_mat.at<cv::Vec3b>(i,j)[0];
-            //Mat 是 BGR
+    {
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(bgr_img, mean, stddev);
+        LOGD("Step1 bgr - mean(B,G,R): (%.2f,%.2f,%.2f)", mean[0], mean[1], mean[2]);
+    }
+
+    // 2. 取得線段端點
+    LOGD("Step 2: Get line points...");
+    cv::Point p_top(top_x, 0);
+    cv::Point p_bottom = get_line_point(p_top.x, p_top.y, line_angle, inputHeight);
+
+    // 3. Resize with padding to 224x224
+    LOGD("Step 3: Resize with padding to 224...");
+    cv::Mat padded = resize_with_padding(bgr_img , 224);
+
+    {
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(padded, mean, stddev);
+        LOGD("Step3 padded - mean(B,G,R): (%.2f,%.2f,%.2f)", mean[0], mean[1], mean[2]);
+        LOGD("padded size: %dx%d (WxH)", padded.cols, padded.rows);
+    }
+
+    // 4. 轉灰階
+    LOGD("Step 4: Convert to gray...");
+    cv::Mat gray;
+    cv::cvtColor(padded, gray, cv::COLOR_BGR2GRAY);
+
+    {
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(gray, mean, stddev);
+        LOGD("Step4 gray - mean: %.2f, std: %.2f", mean[0], stddev[0]);
+    }
+
+    // 5. CLAHE
+    LOGD("Step 5: Apply CLAHE...");
+    cv::Mat enhanced = apply_clahe(gray);
+
+    {
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(enhanced, mean, stddev);
+        LOGD("Step5 enhanced - mean: %.2f, std: %.2f", mean[0], stddev[0]);
+    }
+
+    // ============= 模型預測 =============
+    LOGD("Step 6: Running model inference...");
+
+    TfLiteStatus status = TfLiteInterpreterAllocateTensors(interpreter_);
+    if (status != kTfLiteOk) {
+        LOGE("Failed to allocate tensors!");
+        return nullptr;
+    }
+
+    // 分配輸出 mask 的記憶體 (224x224)
+    int modelOutHeight = 224;
+    int modelOutWidth = 224;
+    int** model_out = new int*[modelOutHeight];
+    for (int i = 0; i < modelOutHeight; i++) {
+        model_out[i] = new int[modelOutWidth];
+    }
+
+    // 呼叫模型推論
+    int seg_status = doseg(enhanced, model_out, interpreter_, false);
+    if (seg_status == -1) {
+        LOGE("Model inference failed!");
+        return nullptr;
+    }
+
+    // 將 mask 轉成 cv::Mat
+    cv::Mat mask(modelOutHeight, modelOutWidth, CV_8UC1);
+    for (int i = 0; i < modelOutHeight; i++) {
+        for (int j = 0; j < modelOutWidth; j++) {
+            mask.at<uchar>(i, j) = (uchar)model_out[i][j];
         }
     }
-//這裡開始=======================================================================================================================================================================
-   // 裁切完還是2D 所以先轉成1D
-   /*int * result = twoDtooneD(result2D, outputHeight, outputWidth);
-   // 把單一channel 1D array 轉回24bit
-   auto self_rgb_colors = std::make_unique<int[]>(outputPixelNumber);
-   for (int i = 0; i < outputPixelNumber; i++){
-     self_rgb_colors[i] = (255u & 0xff) << 24 |(result[i] & 0xff) << 16|
-             (result[i] & 0xff) << 8|
-             (result[i] & 0xff);
-   }*/
-    int i = 0;
-  auto self_rgb_colors = std::make_unique<int[]>(outputPixelNumber);
-  for(int h = 0; h < outputHeight; h++){
-      for(int w = 0; w < outputWidth; w++){
-          int r = result2D[h][w][0];
-          int g = result2D[h][w][1];
-          int b = result2D[h][w][2];
-          self_rgb_colors[i++] = (255u & 0xff) << 24 |(r & 0xff) << 16 |(g & 0xff) << 8|(b & 0xff);
-      }
-  }
 
-  return self_rgb_colors;
+    // 輸出 mask 資訊
+    int whiteCount = 0;
+    int minX = 224, maxX = 0, minY = 224, maxY = 0;
+    for (int i = 0; i < modelOutHeight; i++) {
+        for (int j = 0; j < modelOutWidth; j++) {
+            if (mask.at<uchar>(i, j) > 0) {
+                whiteCount++;
+                if (i < minY) minY = i;
+                if (i > maxY) maxY = i;
+                if (j < minX) minX = j;
+                if (j > maxX) maxX = j;
+            }
+        }
+    }
+    LOGD("=== Mask Output ===");
+    LOGD("White pixels: %d / %d", whiteCount, modelOutHeight * modelOutWidth);
+    LOGD("Target size: %dx%d (WxH)", mask.cols, mask.rows);
+    if (whiteCount > 0) {
+        LOGD("Y range: %d~%d, X range: %d~%d", minY, maxY, minX, maxX);
+    } else {
+        LOGD("Mask is all black!");
+    }
+
+    cv::Mat mask_output = mask;
+
+    // ============= 後處理 =============
+    LOGD("Step 7: postprocess");
+    PostProcessResult result = postprocess(mask_output, enhanced, cv::Point(top_x, 0), p_bottom, inputHeight, inputWidth);
+
+
+    if (result.success) {
+        LOGD("=== PostProcess Results ===");
+        LOGD("Absolute angle: %.2f", result.angle_abs);
+        LOGD("Relative angle: %.2f", result.angle_relative);
+        LOGD("Center point: (%d, %d)", result.center.x, result.center.y);
+        LOGD("Intersection top: (%d, %d)", result.intersection_top.x, result.intersection_top.y);
+        LOGD("Intersection bottom: (%d, %d)", result.intersection_bottom.x, result.intersection_bottom.y);
+        LOGD("Vessel width at green line: %.2f pixels", result.vessel_diameter);
+    }
+
+    // 8. mask放大回原始尺寸
+    LOGD("Step 8: Resize back to %dx%d...", inputWidth, inputHeight);
+    cv::Mat final_mask;
+    if (inputHeight > inputWidth) {
+        final_mask = resize_img(mask, inputHeight);
+        int width_pad = (inputHeight - inputWidth) / 2;
+        final_mask = crop_img(final_mask, width_pad, width_pad + inputWidth, 0, inputHeight);
+    } else {
+        final_mask = resize_img(mask, inputWidth);
+        int width_pad = (inputWidth - inputHeight) / 2;
+        final_mask = crop_img(final_mask, 0, inputWidth, width_pad, width_pad + inputHeight);
+    }
+
+    if (final_mask.empty()) {
+        LOGE("final_output is empty after resize!");
+        final_mask = cv::Mat(inputHeight, inputWidth, CV_8UC3, cv::Scalar(0, 0, 0));
+    }
+
+    ////////////////////////////////// 測試結果用(可省略)
+    // 視覺化
+    cv::Mat visualize_img = visualizePostProcess(bgr_img, result);
+    if (visualize_img.empty()) {
+        LOGE("final_img is empty! Using original image instead.");
+        visualize_img = bgr_img.clone();
+    }
+    LOGD("final_img size: %dx%d, channels: %d", visualize_img.cols, visualize_img.rows, visualize_img.channels());
+    //////////////////////////////////
+
+    if (visualize_img.channels() == 1) {
+        LOGE("final_img is 1 channels");
+        cv::cvtColor(visualize_img, visualize_img, cv::COLOR_GRAY2BGR);
+    }
+
+    // 9. 轉成 int array
+    LOGD("Step 9: Converting to int array...");
+
+    int outputPixelNumber = visualize_img.rows * visualize_img.cols;
+    auto result_array = std::make_unique<int[]>(outputPixelNumber);
+
+    for (int i = 0; i < outputPixelNumber; i++) {
+        int h = i / visualize_img.cols;
+        int w = i % visualize_img.cols;
+
+        cv::Vec3b pixel = visualize_img.at<cv::Vec3b>(h, w);
+
+        uchar b = pixel[0];
+        uchar g = pixel[1];
+        uchar r = pixel[2];
+
+        result_array[i] =
+                (255u << 24) |   // Alpha
+                (r << 16)    |   // Red
+                (g << 8)     |   // Green
+                (b);             // Blue
+    }
+
+    last_result_ = result;
+
+    return result_array;
 }
 
 }  // namespace superresolution
 }  // namespace examples
 }  // namespace tflite
-

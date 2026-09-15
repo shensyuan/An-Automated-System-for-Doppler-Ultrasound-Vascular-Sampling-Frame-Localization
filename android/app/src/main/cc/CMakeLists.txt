@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.4.1)
+cmake_minimum_required(VERSION 3.22.1)
+project(SuperResolution)
 
 set(TFLITE_LIBPATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../../libraries/tensorflowlite/jni")
 set(TFLITE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../libraries/tensorflowlite/headers")

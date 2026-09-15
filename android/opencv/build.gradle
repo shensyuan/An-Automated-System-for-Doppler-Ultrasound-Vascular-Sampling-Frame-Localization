@@ -93,7 +93,7 @@ apply plugin: 'com.android.library'
 println "OpenCV: " + project.buildscript.sourceFile
 
 android {
-    namespace 'org.opencv'
+    namespace "org.opencv"
     compileSdk 36
 
     defaultConfig {
@@ -108,26 +108,23 @@ android {
         }
     }
 
-    buildFeatures {
-        aidl true
-        buildConfig true
-    }
-
-    packaging {
-        jniLibs { keepDebugSymbols += ["**/*.so"] }
-    }
-
     buildTypes {
         debug {
+            packagingOptions {
+                doNotStrip '**/*.so'
+            }
         }
         release {
+            packagingOptions {
+                doNotStrip '**/*.so'
+            }
             minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.txt'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.txt'
         }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
 
     sourceSets {
