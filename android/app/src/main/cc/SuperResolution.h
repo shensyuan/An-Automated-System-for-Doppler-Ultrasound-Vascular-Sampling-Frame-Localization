@@ -76,7 +76,7 @@ private:
     cv::Mat process_single_centerline(const cv::Mat& img_orig, const cv::Mat& mask_224);
     cv::Mat resize_img(const cv::Mat& img, int size);
     cv::Mat crop_img(const cv::Mat& img, int x1, int x2, int y1, int y2);
-    void thinningZhangSuen(const cv::Mat& src, cv::Mat& dst);
+    void thinningCenterLine(const cv::Mat& src, cv::Mat& dst);
     bool is_valid_centerline(const std::vector<int>& x_pts, const std::vector<int>& y_pts);
     cv::Point2f catmullRomPoint(const cv::Point2f& p0, const cv::Point2f& p1,
                                 const cv::Point2f& p2, const cv::Point2f& p3, float t);

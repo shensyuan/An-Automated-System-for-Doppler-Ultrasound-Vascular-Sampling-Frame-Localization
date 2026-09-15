@@ -27,8 +27,8 @@ cv::Mat crop_img(const cv::Mat& img, int x1, int x2, int y1, int y2) {
     return img(cv::Range(y1, y2), cv::Range(x1, x2)).clone();
 }
 
-// Zhang-Suen thinning algorithm for skeletonization
-void thinningZhangSuen(const cv::Mat& src, cv::Mat& dst) {
+// Center Line thinning algorithm for skeletonization
+void thinningCenterLine(const cv::Mat& src, cv::Mat& dst) {
     dst = src.clone();
     if (dst.channels() > 1) {
         cv::cvtColor(dst, dst, cv::COLOR_BGR2GRAY);
@@ -233,7 +233,7 @@ cv::Mat process_single_centerline(const cv::Mat& img_orig, const cv::Mat& mask_2
 
         // Skeletonization via thinning
         cv::Mat skel_region;
-        thinningZhangSuen(single_region, skel_region);
+        thinningCenterLine(single_region, skel_region);
 
         // Get skeleton points
         std::vector<cv::Point> skel_points;

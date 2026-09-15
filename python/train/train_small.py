@@ -158,7 +158,7 @@ def calc_per_image_metrics(y_true, y_pred, smooth=1e-6):
 if __name__ == "__main__":
     total_start_time = time.perf_counter()
     
-    BASE_DIR   = "C:\\collega\\Project\\data\\train"
+    BASE_DIR   = "C:\\collega\\Project\\data\\train"    # 需調整指定路徑
     MODEL_PATH = os.path.join(BASE_DIR, "model/mobilenet_small_unet_last_train237_v456_test1.h5")
     TEST_DIR   = os.path.join(BASE_DIR, "test_data")
     PRED_DIR = os.path.join(BASE_DIR, "pred_mask/predictions_output_small_last_train237_v456_test1_noearly")
@@ -237,12 +237,6 @@ if __name__ == "__main__":
     print(f"FPS                 : {1.0 / per_image_time:.2f}")
 
     print("\nGenerating predicted masks...")
-    # for i in range(len(raw_imgs)):
-    #     filename = filenames[i]
-    #     pred_mask = np.squeeze(pred_binary[i]).astype(np.uint8) * 255
-
-    #     save_path = os.path.join(PRED_DIR, filename)
-    #     cv2.imwrite(save_path, pred_mask)
         
     for fname, pred, gt in zip(filenames, pred_binary, Y_test):
             mask = (pred > 0.5).astype(np.uint8) * 255

@@ -22,7 +22,7 @@ cv::Mat apply_clahe(const cv::Mat& gray) {
 }
 
 // ==================== Remove Green / Red ====================
-
+// 去除原本超音波音束的資訊，保留黑白影像
 cv::Mat remove_green_red(const cv::Mat& img) {
 
     cv::Mat hsv;
