@@ -43,69 +43,62 @@ Demo video：<https://drive.google.com/file/d/1T_JKMZ3sjOHdsewaSxW32veMggLWTDnQ/
 把選定影像的像素陣列透過 JNI（[`SuperResolution_jni.cpp`](android/app/src/main/cc/SuperResolution_jni.cpp)）丟進 native 端的
 [`SuperResolution` C++ 類別](android/app/src/main/cc/SuperResolution.cpp) 執行整條 pipeline，並把結果畫回畫面。
 
-「2. 前處理」「3. TFLite 模型預測」「4. 後處理」「5. 計算結果」四步對應到
-[`SuperResolution.cpp`](android/app/src/main/cc/SuperResolution.cpp) 裡的 `DoSuperResolution()`、`doseg()`、`postprocess()`。
+「實際掃描」的五個步驟對應到：
+
+| 步驟 | 執行端 | 函式 |
+|---|---|---|
+| 1. 取樣線偵測 | JNI | `detectLineFromJNI`（對應 `pre.py` 的 `detected_line`） |
+| 2. 前處理 | JNI + `DoSuperResolution` | `removeGreenRedFromJNI`（對應 `remove_green_red`）→ `get_line_point` → `resize_with_padding` → 灰階 → `apply_clahe` |
+| 3. TFLite 模型預測 | `doseg` | 224×224 灰階 → 血管分割 mask |
+| 4. 後處理 | `postprocess` | `process_single_centerline`（中心線）→ `get_tangent_direction`（PCA 切線）→ `find_RangeGate`（血管邊界）→ `calculate_angle_between_vectors`；取樣線與中心線無交點時以 `kFallbackBeamAngleDeg` 備援 |
+| 5. 計算結果 | `visualizePostProcess` + JNI `PW_*` | 疊圖回傳 Java 顯示；`PW_DOPPLER_ANGLE` / `PW_Center_Point` / `PW_RANGE_GATE` / `PW_VESSEL_DIAMETER` 取數值 |
 
 ### 關鍵常數（[`SuperResolution.h`](android/app/src/main/cc/SuperResolution.h)）
 
-| 常數 | 意義 |
-|---|---|
-| `inputHeight/Width` (886x720) | 原始輸入影格解析度 |
-| `initCropX0/X1/Y0/Y1` | 粗裁切 ROI 邊界 |
-| `modelinputHeight/Width/Channels` (128x512x2) | 送進 TFLite 模型的輸入張量大小（Sobel + Prewitt 兩張特徵圖） |
-| `modeloutputHeight/Width/Channel` (128x512x1) | 模型輸出的分割遮罩大小 |
-| `outputthreshold` (5) | 分割輸出轉二值圖的閾值 |
+| 常數 | 值 | 意義 |
+|---|---|---|
+| `inputHeight` / `inputWidth` | 700 / 900 | 輸入影格解析度（與 Java 端 `LR_IMAGE_*` 一致） |
+| 模型輸入 / 輸出（`doseg`） | 224×224 | 由 tensor 維度讀取，輸出 mask 以 `val×255 > 128` 二值化 |
+| `kRangeGateRatio` | 2/3 | Range Gate 位置：從中心點往血管上下邊界前進的比例 |
+| `kFallbackBeamAngleDeg` | 75 | 備援線束角度（相對 +x 軸、順時針為正；即偏離垂直 15°） |
 
 ### 各函式對應
 
-| 階段 | 函式 |
+| 階段 | 函式（`SuperResolution.cpp`） |
 |---|---|
-| 前處理：格式轉換 | `mat2int` / `int2mat` / `oneDtotwoD` / `twoDtooneD` |
-| 前處理：ROI 裁切 | `InitCrop` |
-| 血管軸/壁定位 | `get_cropImg_axis`（先用 `smooth` 做多層移動平均，再抓局部極大值推測血管壁位置） |
-| 去噪 | `eliNoise`、`imgsToPrewitt` |
-| TFLite 模型推論 | `doseg`（Sobel + Prewitt 特徵 → resize → 餵進 `TfLiteInterpreter` → threshold） |
-| 結果貼回 | `pasteBack` |
-| 後處理／量測 | `postprocess`（輪廓偵測、IMT 與 LD/IAD 比值計算、文字疊圖） |
-| 整合入口 | `DoSuperResolution`（JNI 呼叫的主函式） |
+| 前處理 | `apply_clahe`、`resize_with_padding`、`get_line_point` |
+| 中心線 | `thinningZhangSuen`、`is_valid_centerline`、`catmullRomPoint`、`generateSplinePoints`、`process_single_centerline` |
+| 線束 / Range Gate | `find_RangeGate`、`get_boundary_intersection_direct`、`get_tangent_direction`、`calculate_angle_between_vectors` |
+| 模型 | 建構子（載入模型、建立 interpreter）、`doseg` |
+| 視覺化 | `draw_tangent`、`draw_perpendicular_line`、`visualizePostProcess` |
+| 整合入口 | `DoSuperResolution`（JNI 呼叫的主函式）、`postprocess` |
 
-### 檔案地圖（`android/`，清理後僅保留建置與執行必需項目）
+### 檔案地圖（`android/`）
 
 ```
 android/
-├── README.md                ← 原始建置說明（TFLite 範例遺留，步驟仍可用）
-├── .gitignore                ← 忽略 build/IDE 快取與可重新下載的 aar
+├── README.md                 ← Android 端詳細說明（後處理細節、JNI API 回傳值、可調參數）
+├── .gitignore                ← 忽略 build/IDE 快取、OpenCV 靜態庫與未使用的測試影格
 ├── build.gradle / settings.gradle / gradle.properties / gradlew(.bat) / gradle/
-│                             ← Gradle 專案骨架
 ├── app/
-│   ├── build.gradle          ← App 模組設定；CMake 參數 -DOpenCV_DIR 指到 opencv/native
-│   ├── download.gradle       ← 建置前自動下載 ESRGAN.tflite 與 TFLite aar
-│   ├── proguard-rules.pro
+│   ├── build.gradle          ← compileSdk 36、NDK 27.0.12077973、CMake 3.22.1；-DOpenCV_DIR 指到 opencv/native
+│   ├── download.gradle       ← fetchTFLiteLibs：下載並解出 TFLite C API（不會下載模型）
 │   └── src/main/
-│       ├── AndroidManifest.xml
-│       ├── assets/           ← ESRGAN.tflite（模型）+ old.jpg/young.jpg/liang.jpg（Demo 用測試影格）
-│       ├── cc/                ← ★ Pipeline 核心 native 程式碼
-│       │   ├── CMakeLists.txt
-│       │   ├── SuperResolution.h / .cpp   ← pipeline 邏輯（見上）
-│       │   └── SuperResolution_jni.cpp    ← JNI 橋接
-│       ├── java/.../superresolution/
-│       │   ├── MainActivity.java   ← App 進入點、模型載入、UI 綁定
-│       │   └── AssetsUtil.java     ← Asset 檔案讀取工具
-│       ├── jniLibs/<ABI>/libopencv_java4.so  ← OpenCV 動態庫（Gradle 直接打包用）
-│       └── res/               ← Demo UI layout / 字串 / 圖示
-├── libraries/                 ← TFLite C API 標頭與 .so（4 個 ABI，download.gradle 可重新產生）
-└── opencv/                    ← OpenCV Android SDK（已精簡，見下）
-    ├── build.gradle           ← Gradle library module，負責把 libopencv_java4.so 打包進 APK
-    ├── java/{src,res,AndroidManifest.xml}  ← OpenCV Java wrapper（本專案未在 Java 端呼叫，僅作打包用）
-    ├── libcxx_helper/         ← dummy native target，用來帶入 libc++_shared.so
-    ├── native/jni/include/    ← OpenCV C++ 標頭（cc/ 的 native pipeline 需要）
-    ├── native/libs/<ABI>/libopencv_java4.so  ← OpenCV 動態庫（CMake 直接連結這份）
-    └── etc/licenses/          ← 第三方授權文字（合規保留）
+│       ├── assets/           ← ESRGAN.tflite（血管分割模型）+ 3 張 demo 影格
+│       ├── cc/               ← ★ native pipeline（SuperResolution.h / .cpp、SuperResolution_jni.cpp）
+│       ├── java/.../superresolution/   ← MainActivity.java、AssetsUtil.java
+│       ├── jniLibs/<ABI>/libopencv_java4.so
+│       └── res/
+├── libraries/                ← TFLite C API headers + .so（fetchTFLiteLibs 產生）
+└── opencv/                   ← OpenCV Android SDK（native/jni/include + native/libs）
 ```
 
 ### 建置與執行
 
-1. 需要 Android Studio、Android SDK/NDK（`ndkVersion 26.3.11579264`）。
-2. 在 `android/` 目錄執行 `./gradlew fetchTFLiteLibs`（Windows 用 `gradlew.bat`）：會自動下載 `ESRGAN.tflite` 模型與 TFLite C API 的 headers/`.so`（若 `libraries/`、`assets/ESRGAN.tflite` 已存在則略過）。
+1. 需要 Android Studio、Android SDK（compileSdk 36）、NDK `27.0.12077973`、CMake `3.22.1`。
+2. 若 `android/libraries/tensorflowlite*/` 不存在，在 `android/` 執行 `./gradlew fetchTFLiteLibs`（Windows 用 `gradlew.bat`）。
+   模型 `assets/ESRGAN.tflite` 已進版控，Gradle **不會**自動下載模型；缺檔時 App 會顯示 `TFLite interpreter failed to create!`。
 3. 用 Android Studio 開啟 `android/` 資料夾，等待 Gradle sync + CMake 設定完成。
-4. 連接裝置或啟動模擬器，執行 `app`；也可在 UI 切換 CPU/GPU（`GPU` 開關對應 `TfLiteGpuDelegateV2`）執行推論。
+4. 連接裝置或啟動模擬器，執行 `app`；點選一張 demo 影格後按 `Upsample`。
+
+詳細說明（後處理各步驟、JNI API 回傳值與失敗值、可調參數）見 [`android/README.md`](android/README.md)。

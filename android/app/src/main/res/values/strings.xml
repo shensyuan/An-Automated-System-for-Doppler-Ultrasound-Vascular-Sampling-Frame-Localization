@@ -9,5 +9,4 @@
     <string name="super_resolution_image" translatable="false">Super resolution image:</string>
     <string name="natively_scaled_image" translatable="false">Android ImageView-scaled image:</string>
     <string name="upsample" translatable="false">Upsample</string>
-    <string name="gpu" translatable="false">GPU</string>
 </resources>

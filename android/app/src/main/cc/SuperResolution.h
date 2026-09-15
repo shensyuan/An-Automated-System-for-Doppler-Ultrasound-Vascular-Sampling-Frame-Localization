@@ -19,7 +19,6 @@
 #include <opencv2/opencv.hpp>
 #include <string>
 #include "tensorflow/lite/c/c_api.h"
-#include "tensorflow/lite/delegates/gpu/delegate.h"
 
 #define LOG_TAG "super_resolution::"
 #define LOGI(...) \
@@ -30,60 +29,73 @@
 namespace tflite {
 namespace examples {
 namespace superresolution {
-    //註解部分是5/26會議完後提出的變更
-    //input圖片的解析度
-const int inputHeight = 886;//562
-const int inputWidth = 720;
-
-const int inputPixelNumber = inputHeight * inputWidth;
-const int initCropX0 = 40;//0
-const int initCropX1 = 650;//inputWidth
-const int initCropY0 = 200;//0
-const int initCropY1 = 600;//inputHeight;
-const int initCropHeight = initCropY1-initCropY0;
-const int initCropWidth = initCropX1-initCropX0;
-
-const int modelinputHeight = 128;
-const int modelinputWidth = 512;
-const int modelinputChannels = 2;
-//output圖片的解析度
-const int modeloutputHeight = 128;
-const int modeloutputWidth = 512;
-const int modeloutputChannel = 1;
-const int outputthreshold = 5;// predict 出來的圖是灰的 所以會做一個threshold filtering
+const int inputHeight = 700;
+const int inputWidth = 900;
 
 const int outputHeight = inputHeight;
 const int outputWidth = inputWidth;
-const int outputChannel = 3;
 const int outputPixelNumber =  outputHeight * outputWidth;
+
+// 可在此設定 range gate 比例
+constexpr double kRangeGateRatio = 2.0 / 3.0;
+
+// 備援線束角度：當外部給的取樣線與中心線沒有交點時，改以此角度通過中心線中點重新畫一條線束。
+// 角度為影像座標系、相對 +x 軸、順時針為正；75° 即偏離垂直方向 15°。可在此調整。
+constexpr double kFallbackBeamAngleDeg = 75.0;
+
+struct PostProcessResult {
+    double angle_abs;           // 絕對角度
+    double angle_relative;      // 相對角度
+    cv::Point center;           // 中心點
+    cv::Point intersection_top; // 上交點
+    cv::Point intersection_bottom; // 下交點
+    cv::Point p_top;            // 線段上端點
+    cv::Point p_bottom;         // 線段下端點
+    cv::Point2f direction;      // 切線方向
+    double vessel_diameter;   // 血管管徑
+    cv::Point diameter_top;     // 管徑量測上端點（沿法向掃描到的 mask 邊界）
+    cv::Point diameter_bottom;  // 管徑量測下端點
+    cv::Point2f perp_direction; // 血管法向（量測方向）
+    bool success;               // 是否成功
+};
+
 class SuperResolution {
  public:
-  SuperResolution(const void* model_data, size_t model_size, bool use_gpu);
+  SuperResolution(const void* model_data, size_t model_size);
   ~SuperResolution();
   bool IsInterpreterCreated();
-  // DoSuperResolution() performs super resolution on a low resolution image. It
-  // returns a valid pointer if successful and nullptr if unsuccessful.
-  // lr_img_rgb: the pointer to the RGB array extracted from low resolution
-  // image
-  std::unique_ptr<int[]> DoSuperResolution(int* lr_img_rgb);
-  int** mat2int(cv::Mat src);
-  cv::Mat int2mat(int** src, int rows, int cols);
-  int ** oneDtotwoD(int * img_1D, int height, int width);
-  int * twoDtooneD(int ** img_2D, int height, int width);
-  int ** InitCrop(int ** img, int cropX0,int cropX1, int cropY0, int cropY1);
-  int * get_cropImg_axis(int ** img, int height, int width);
-  float * smooth(float* sum, int size, int k);
-  int ** pasteBack(int** top, int** bot, int cropUp, int axis, int cropDown, int oriHeight, int oriWidth);
-  cv::Mat eliNoise(cv::Mat src, int dark, int percentage);
-  cv::Mat imgsToPrewitt(cv::Mat srcImage);
+  std::unique_ptr<int[]> DoSuperResolution(int* lr_img_rgb, double line_angle, int top_x);
   int doseg(cv::Mat src, int** out,TfLiteInterpreter* interpreter_, bool istop);
-  cv::Mat postprocess(cv::Mat src, cv::Mat osrc,int croplinemid , int croplineup);
-    private:
-  // TODO: use unique_ptr
+  PostProcessResult postprocess(const cv::Mat& mask, const cv::Mat& img_ori, cv::Point p_top, cv::Point p_bottom, int image_h, int image_w);
+  cv::Mat apply_clahe(const cv::Mat& gray);
+  cv::Mat resize_with_padding(const cv::Mat& img, int size);
+  cv::Point get_line_point(int top_x, int top_y, double angle_deg, int length);
+  PostProcessResult GetLastResult() const { return last_result_; }
+private:
+    // 後處理相關函數
+    cv::Mat process_single_centerline(const cv::Mat& img_orig, const cv::Mat& mask_224);
+    cv::Mat resize_img(const cv::Mat& img, int size);
+    cv::Mat crop_img(const cv::Mat& img, int x1, int x2, int y1, int y2);
+    void thinningZhangSuen(const cv::Mat& src, cv::Mat& dst);
+    bool is_valid_centerline(const std::vector<int>& x_pts, const std::vector<int>& y_pts);
+    cv::Point2f catmullRomPoint(const cv::Point2f& p0, const cv::Point2f& p1,
+                                const cv::Point2f& p2, const cv::Point2f& p3, float t);
+    std::vector<cv::Point2f> generateSplinePoints(const std::vector<cv::Point2f>& controlPoints, int totalPoints);
+
+    // Line / Range Gate 函數
+    cv::Point find_RangeGate(cv::Point start_pt, cv::Point target_pt, const cv::Mat& img);
+    std::pair<cv::Point, cv::Point> get_boundary_intersection_direct(cv::Size mask_shape, cv::Point center_pt, double angle_deg);
+    cv::Point2f get_tangent_direction(const cv::Mat& skeleton, cv::Point point, int window_size);
+    double calculate_angle_between_vectors(cv::Point p1, cv::Point p2, const cv::Point2f& v_given, bool absolute);
+    void draw_tangent(cv::Mat& img, cv::Point point, const cv::Point2f& direction, int length);
+    std::pair<cv::Point, cv::Point> draw_perpendicular_line(cv::Mat& image, cv::Point line_p1, cv::Point line_p2,
+                                                            cv::Point point, int length, cv::Scalar color, int thickness);
+    // 視覺化
+    cv::Mat visualizePostProcess(const cv::Mat& img_ori, const PostProcessResult& result);
+  PostProcessResult  last_result_;
   TfLiteInterpreter* interpreter_;
   TfLiteModel* model_ = nullptr;
   TfLiteInterpreterOptions* options_ = nullptr;
-  TfLiteDelegate* delegate_ = nullptr;
 };
 
 }  // namespace superresolution
