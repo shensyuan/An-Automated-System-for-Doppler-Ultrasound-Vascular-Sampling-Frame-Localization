@@ -136,7 +136,7 @@ cv::Mat SuperResolution::crop_img(const cv::Mat& img, int x1, int x2, int y1, in
  * @param src 輸入 mask（>127 視為前景；若為彩色會先轉灰階）
  * @param dst 輸出骨架（CV_8UC1，前景 255 / 背景 0），與 src 同尺寸
  */
-void SuperResolution::thinningZhangSuen(const cv::Mat& src, cv::Mat& dst) {
+void SuperResolution::thinningCenterLine(const cv::Mat& src, cv::Mat& dst) {
     dst = src.clone();
     if (dst.channels() > 1) {
         cv::cvtColor(dst, dst, cv::COLOR_BGR2GRAY);
@@ -361,7 +361,7 @@ cv::Mat SuperResolution::process_single_centerline(const cv::Mat& img_orig, cons
         cv::distanceTransform(single_region, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
 
         cv::Mat skel_region;
-        thinningZhangSuen(single_region, skel_region);
+        thinningCenterLine(single_region, skel_region);
 
         std::vector<cv::Point> skel_points;
         cv::findNonZero(skel_region, skel_points);

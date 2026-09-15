@@ -29,7 +29,7 @@ Demo video：<https://drive.google.com/file/d/1T_JKMZ3sjOHdsewaSxW32veMggLWTDnQ/
 
 ### 後處理細節（`postprocess`）
 
-1. **中心線擷取** `process_single_centerline`：mask 二值化 → 8 連通元件（<20 px 略過）→ 距離轉換 → Zhang-Suen 細線化（`thinningZhangSuen`）→ 每個 x 欄取距離值最大的骨架點 → `is_valid_centerline` 篩選 → 座標縮放回原圖 → Catmull-Rom 樣條（`generateSplinePoints`）內插成平滑中心線。
+1. **中心線擷取** `process_single_centerline`：mask 二值化 → 8 連通元件（<20 px 略過）→ 距離轉換 → Zhang-Suen 細線化（`thinningCenterLine`）→ 每個 x 欄取距離值最大的骨架點 → `is_valid_centerline` 篩選 → 座標縮放回原圖 → Catmull-Rom 樣條（`generateSplinePoints`）內插成平滑中心線。
 2. **決定 center 與線束**
    - 外部取樣線與中心線**有交點**：以第一個交點為 `center`，線束沿用外部取樣線。
    - **無交點（備援）**：取中心線中位點為 `center`，以 `kFallbackBeamAngleDeg` 通過 `center` 重畫一條線束（`get_boundary_intersection_direct`）。
@@ -56,7 +56,7 @@ Demo video：<https://drive.google.com/file/d/1T_JKMZ3sjOHdsewaSxW32veMggLWTDnQ/
 |---|---|
 | 前處理 | `apply_clahe`、`resize_with_padding`、`get_line_point` |
 | 尺寸轉換 | `resize_img`、`crop_img` |
-| 中心線 | `thinningZhangSuen`、`is_valid_centerline`、`catmullRomPoint`、`generateSplinePoints`、`process_single_centerline` |
+| 中心線 | `thinningCenterLine`、`is_valid_centerline`、`catmullRomPoint`、`generateSplinePoints`、`process_single_centerline` |
 | 線束 / Range Gate | `find_RangeGate`、`get_boundary_intersection_direct`、`get_tangent_direction`、`calculate_angle_between_vectors` |
 | 繪圖 | `draw_tangent`、`draw_perpendicular_line`、`visualizePostProcess` |
 | 模型 | 建構子（載入模型、建立 interpreter）、`IsInterpreterCreated`、`doseg` |

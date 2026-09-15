@@ -10,10 +10,6 @@ import keras.backend as K
 from post_processor import post_process
 import pre_processor
 import time
-# from tensorflow.keras import layers, models
-# from tensorflow.keras.applications import MobileNetV3Large
-# from tensorflow.keras.optimizers import Adam
-# import tensorflow.keras.backend as K
 
 
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -127,19 +123,15 @@ def dice_per_image(y_true, y_pred, smooth=1e-6):
 if __name__ == "__main__":
     start_time = time.perf_counter()
     
-    # C:\collega\Project\data\train\test_data\test_masks
-    BASE_DIR   = "C:\\collega\\Project\\data\\train"
+    
+    BASE_DIR   = "C:\\collega\\Project\\data\\train"  # 需調整指定路徑
     TEST_DIR   = os.path.join(BASE_DIR, "test_data")
     MODEL_PATH = os.path.join(BASE_DIR, "model/vessel_lumen_mobilenet_large_unet.h5")
     PRED_DIR   = os.path.join(BASE_DIR, "pred_mask/predictions_output_large")
     OUTPUT_DIR   = os.path.join(BASE_DIR, "result/line_large")
     INPUT_DIR  = os.path.join(BASE_DIR, "input_data/input_image/data3")
     
-    frames ={}
-    # filenames = []
-    # all_line_frames = []
-    # all_frames = []
-    
+    frames ={}    
     pre_start_time = time.perf_counter()
     no_ui_frames, line_frames, file_names, image_h, image_w = pre_processor.extract_frames_with_timestamp(INPUT_DIR)
         

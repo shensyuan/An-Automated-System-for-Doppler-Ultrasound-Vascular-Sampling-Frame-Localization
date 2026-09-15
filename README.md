@@ -67,7 +67,7 @@ Demo video：<https://drive.google.com/file/d/1T_JKMZ3sjOHdsewaSxW32veMggLWTDnQ/
 | 階段 | 函式（`SuperResolution.cpp`） |
 |---|---|
 | 前處理 | `apply_clahe`、`resize_with_padding`、`get_line_point` |
-| 中心線 | `thinningZhangSuen`、`is_valid_centerline`、`catmullRomPoint`、`generateSplinePoints`、`process_single_centerline` |
+| 中心線 | `thinningCenterLine`、`is_valid_centerline`、`catmullRomPoint`、`generateSplinePoints`、`process_single_centerline` |
 | 線束 / Range Gate | `find_RangeGate`、`get_boundary_intersection_direct`、`get_tangent_direction`、`calculate_angle_between_vectors` |
 | 模型 | 建構子（載入模型、建立 interpreter）、`doseg` |
 | 視覺化 | `draw_tangent`、`draw_perpendicular_line`、`visualizePostProcess` |
@@ -97,7 +97,7 @@ android/
 
 1. 需要 Android Studio、Android SDK（compileSdk 36）、NDK `27.0.12077973`、CMake `3.22.1`。
 2. 若 `android/libraries/tensorflowlite*/` 不存在，在 `android/` 執行 `./gradlew fetchTFLiteLibs`（Windows 用 `gradlew.bat`）。
-   模型 `assets/ESRGAN.tflite` 已進版控，Gradle **不會**自動下載模型；缺檔時 App 會顯示 `TFLite interpreter failed to create!`。
+   模型 `assets/ESRGAN.tflite` 已進版控，Gradle **不會**自動下載模型，若缺檔時 App 會顯示 `TFLite interpreter failed to create!`。
 3. 用 Android Studio 開啟 `android/` 資料夾，等待 Gradle sync + CMake 設定完成。
 4. 連接裝置或啟動模擬器，執行 `app`；點選一張 demo 影格後按 `Upsample`。
 
