@@ -10,7 +10,10 @@ Demo video：<https://drive.google.com/file/d/1T_JKMZ3sjOHdsewaSxW32veMggLWTDnQ/
 |---|---|---|
 | [`python/train/`](python/train) | **離線模型訓練**：資料前處理、標記、增廣、訓練分割模型、轉換成 TFLite | 模型訓練 1~4 |
 | [`cpp/`](cpp) | **前/後處理邏輯的 C++ 驗證版**：用既有標記（ground-truth mask）直接跑前處理與後處理量測，不含模型推論，用於在部署到 Android 之前，用原生 C++ 驗證/校準前處理與量測邏輯的正確性 | 對應「實際掃描」的 2. 前處理 / 4. 後處理 |
-| [`android/`](android) | **端側部署**：載入訓練好的 `.tflite` 模型，在裝置上即時對超音波影格做前處理 → 模型推論 → 後處理量測 | 實際掃描 1~5（完整流程） |
+| [`android/`](android)（私有 submodule） | **端側部署**：載入訓練好的 `.tflite` 模型，在裝置上即時對超音波影格做前處理 → 模型推論 → 後處理量測 | 實際掃描 1~5（完整流程） |
+
+> `android/` 是私有 repo [`shensyuan/PW-Andriod`](https://github.com/shensyuan/PW-Andriod) 的 git submodule，需要存取權限才能取得內容；
+> 下文所有 `android/...` 連結同樣需要權限。clone 時請用 `git clone --recurse-submodules <url>`，或在既有 clone 內執行 `git submodule update --init`。
 
 `python/train/` 訓練出的模型會轉換成 `.tflite`，放進
 [`android/app/src/main/assets/ESRGAN.tflite`](android/app/src/main/assets/ESRGAN.tflite)（沿用 TensorFlow Lite 官方範例的檔名，實際是血管分割模型）給 Android 端載入使用。
@@ -36,7 +39,7 @@ Demo video：<https://drive.google.com/file/d/1T_JKMZ3sjOHdsewaSxW32veMggLWTDnQ/
 用來在不牽涉 TFLite 模型的情況下，以原生 C++ 驗證前/後處理邏輯與 Android 端 native pipeline 的實作是否一致，可視為
 [`android/app/src/main/cc/SuperResolution.cpp`](android/app/src/main/cc/SuperResolution.cpp) 的前身/桌面對照組。
 
-## 4. Android 端部署（`android/`）
+## 4. Android 端部署（`android/`，私有 submodule）
 
 進入點是 [`MainActivity.java`](android/app/src/main/java/org/tensorflow/lite/examples/superresolution/MainActivity.java)：載入
 `ESRGAN.tflite` 模型（透過 [`AssetsUtil`](android/app/src/main/java/org/tensorflow/lite/examples/superresolution/AssetsUtil.java)）、
@@ -95,10 +98,11 @@ android/
 
 ### 建置與執行
 
-1. 需要 Android Studio、Android SDK（compileSdk 36）、NDK `27.0.12077973`、CMake `3.22.1`。
-2. 若 `android/libraries/tensorflowlite*/` 不存在，在 `android/` 執行 `./gradlew fetchTFLiteLibs`（Windows 用 `gradlew.bat`）。
+1. 取得 submodule 內容（需要私有 repo 權限）。
+2. 需要 Android Studio、Android SDK（compileSdk 36）、NDK `27.0.12077973`、CMake `3.22.1`。
+3. 若 `android/libraries/tensorflowlite*/` 不存在，在 `android/` 執行 `./gradlew fetchTFLiteLibs`（Windows 用 `gradlew.bat`）。
    模型 `assets/ESRGAN.tflite` 已進版控，Gradle **不會**自動下載模型，若缺檔時 App 會顯示 `TFLite interpreter failed to create!`。
-3. 用 Android Studio 開啟 `android/` 資料夾，等待 Gradle sync + CMake 設定完成。
-4. 連接裝置或啟動模擬器，執行 `app`；點選一張 demo 影格後按 `Upsample`。
+4. 用 Android Studio 開啟 `android/` 資料夾，等待 Gradle sync + CMake 設定完成。
+5. 連接裝置或啟動模擬器，執行 `app`；點選一張 demo 影格後按 `Upsample`。
 
 詳細說明（後處理各步驟、JNI API 回傳值與失敗值、可調參數）見 [`android/README.md`](android/README.md)。
